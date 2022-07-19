@@ -53,6 +53,15 @@ const FORMAT_TIME_HOUR string = "2006010215"
 
 var _log *Logger = New()
 
+const DebugOn = 1
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if DebugOn > 0 {
+		log.Printf(format, a...)
+	}
+	return
+}
+
 func init() {
 	SetFlags(Ldate | Ltime | Lshortfile)
 	SetHighlighting(runtime.GOOS != "windows")

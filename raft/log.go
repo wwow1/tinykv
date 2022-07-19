@@ -56,7 +56,15 @@ type RaftLog struct {
 // to the state that it just commits and applies the latest snapshot.
 func newLog(storage Storage) *RaftLog {
 	// Your Code Here (2A).
-	return nil
+	raftlog := &RaftLog{}
+	raftlog.storage = storage
+	raftlog.stabled, _ = storage.LastIndex()
+	start, _ := storage.FirstIndex()
+	end, _ := storage.LastIndex()
+	raftlog.entries, _ = storage.Entries(start, end+1)
+	hardState, _, _ := storage.InitialState()
+	raftlog.committed = hardState.Commit
+	return raftlog
 }
 
 // We need to compact the log entries in some point of time like
@@ -67,25 +75,74 @@ func (l *RaftLog) maybeCompact() {
 }
 
 // unstableEntries return all the unstable entries
-func (l *RaftLog) unstableEntries() []pb.Entry {
-	// Your Code Here (2A).
-	return nil
+func (l *RaftLog) unstableEntries() (ents []pb.Entry) {
+	// may update after snapshot
+	lastIndex := l.LastIndex()
+	ents = make([]pb.Entry, 0, lastIndex-l.stabled)
+	for i := l.stabled; i < lastIndex; i++ {
+		ents = append(ents, l.entries[i])
+	}
+	return
+}
+
+// 删除的日志条目一定在commit之后，所以是放在raftLog.entries中（未持久化）
+func (l *RaftLog) ClearEntsAfter(index uint64) {
+	l.entries = l.entries[:index]
+}
+
+func (l *RaftLog) AppendEntries(entries []*pb.Entry, term uint64) {
+	if len(entries) == 0 {
+		return
+	}
+	start := l.LastIndex() + 1
+	nextIndex := start
+	for _, entry := range entries {
+		ent := *entry
+		if ent.Index == 0 {
+			ent.Index = nextIndex
+		}
+		if ent.Term == 0 {
+			ent.Term = term
+		}
+		l.entries = append(l.entries, ent)
+		nextIndex++
+	}
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
-	// Your Code Here (2A).
-	return nil
+	// may update after installing snapshot module
+	for i := l.applied; i < l.committed; i++ {
+		ents = append(ents, l.entries[i])
+	}
+	return
+}
+
+// caller must ensure i > l.stabled
+func (l *RaftLog) entsAfter(i uint64) (ents []*pb.Entry) {
+	// may update after snapshot
+	lastIndex := l.LastIndex()
+	for ; i < lastIndex; i++ {
+		ents = append(ents, &(l.entries[i]))
+	}
+	return
 }
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
-	// Your Code Here (2A).
-	return 0
+	var lastIndex uint64
+	if len(l.entries) > 0 {
+		lastIndex = l.entries[len(l.entries)-1].Index
+	} else {
+		lastIndex = 0
+	}
+	return lastIndex
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
-	// Your Code Here (2A).
-	return 0, nil
+	if i == 0 {
+		return 0, nil
+	}
+	return l.entries[i-1].Term, nil
 }
