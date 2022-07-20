@@ -431,6 +431,7 @@ func (r *Raft) updateCommitIndex() {
 			r.sendAppend(peer)
 		}
 	}
+	r.RaftLog.stabled = max(r.RaftLog.stabled, r.RaftLog.committed)
 }
 
 func (r *Raft) appendEntries2Follower(m pb.Message, reply *pb.Message) {
@@ -485,6 +486,7 @@ func (r *Raft) appendEntries2Follower(m pb.Message, reply *pb.Message) {
 		}
 		r.RaftLog.committed = min(m.Commit, lastNewEntry)
 	}
+	r.RaftLog.stabled = max(r.RaftLog.stabled, r.RaftLog.committed)
 	reply.Index = r.RaftLog.LastIndex() // NextIndex
 	reply.Reject = false
 }

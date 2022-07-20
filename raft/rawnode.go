@@ -68,14 +68,21 @@ type Ready struct {
 
 // RawNode is a wrapper of Raft.
 type RawNode struct {
-	Raft *Raft
+	Raft      *Raft
+	hardState pb.HardState
 	// Your Data Here (2A).
 }
 
 // NewRawNode returns a new RawNode given configuration and a list of raft peers.
 func NewRawNode(config *Config) (*RawNode, error) {
 	// Your Code Here (2A).
-	return nil, nil
+	rn := &RawNode{Raft: newRaft(config)}
+	var err error
+	rn.hardState, _, err = rn.Raft.RaftLog.storage.InitialState()
+	if err != nil {
+		panic("NewRawNode::InitialState")
+	}
+	return rn, nil
 }
 
 // Tick advances the internal logical clock by a single tick.
@@ -142,13 +149,55 @@ func (rn *RawNode) Step(m pb.Message) error {
 
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
-	// Your Code Here (2A).
-	return Ready{}
+	ready := Ready{Entries: []pb.Entry{}, CommittedEntries: []pb.Entry{}}
+	nowHardState := pb.HardState{
+		Term:   rn.Raft.Term,
+		Vote:   rn.Raft.Vote,
+		Commit: rn.Raft.RaftLog.committed,
+	}
+	if !isHardStateEqual(rn.hardState, nowHardState) {
+		ready.HardState = nowHardState
+	}
+	alreadyStabledIndex, err := rn.Raft.RaftLog.storage.LastIndex()
+	if err != nil {
+		panic("Ready::LastIndex")
+	}
+	// TODO(zhengfuyu):stabled回退的情况，是否还要考虑删除已持久化的部分日志条目？
+	if rn.Raft.RaftLog.stabled > alreadyStabledIndex {
+		for i := alreadyStabledIndex + 1; i <= rn.Raft.RaftLog.stabled; i++ {
+			ready.Entries = append(ready.Entries, rn.Raft.RaftLog.entries[i-1])
+		}
+	}
+	if rn.Raft.RaftLog.committed > rn.Raft.RaftLog.applied {
+		for i := rn.Raft.RaftLog.applied + 1; i <= rn.Raft.RaftLog.committed; i++ {
+			// TODO(zhengfuyu):加入快照以后，也许不能直接通过i-1来寻址数组中的日志条目了
+			ready.CommittedEntries = append(ready.CommittedEntries, rn.Raft.RaftLog.entries[i-1])
+		}
+	}
+	ready.Messages = rn.Raft.msgs
+	return ready
 }
 
 // HasReady called when RawNode user need to check if any Ready pending.
 func (rn *RawNode) HasReady() bool {
-	// Your Code Here (2A).
+	nowHardState := pb.HardState{
+		Term:   rn.Raft.Term,
+		Vote:   rn.Raft.Vote,
+		Commit: rn.Raft.RaftLog.committed,
+	}
+	if !isHardStateEqual(rn.hardState, nowHardState) {
+		return true
+	}
+	alreadyStabledIndex, err := rn.Raft.RaftLog.storage.LastIndex()
+	if err != nil {
+		panic("HasReady::LastIndex")
+	}
+	if rn.Raft.RaftLog.stabled > alreadyStabledIndex {
+		return true
+	}
+	if rn.Raft.RaftLog.committed > rn.Raft.RaftLog.applied {
+		return true
+	}
 	return false
 }
 
@@ -156,6 +205,13 @@ func (rn *RawNode) HasReady() bool {
 // last Ready results.
 func (rn *RawNode) Advance(rd Ready) {
 	// Your Code Here (2A).
+	if !isHardStateEqual(pb.HardState{}, rd.HardState) {
+		rn.hardState = rd.HardState
+	}
+	if len(rd.CommittedEntries) != 0 {
+		rn.Raft.RaftLog.applied = max(rd.CommittedEntries[len(rd.CommittedEntries)-1].Index,
+			rn.Raft.RaftLog.applied)
+	}
 }
 
 // GetProgress return the Progress of this node and its peers, if this
