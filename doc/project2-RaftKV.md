@@ -80,7 +80,7 @@ Before introducing the code, you need to understand three terms first: `Store`, 
 - Peer stands for a Raft node which is running on a Store
 - Region is a collection of Peers, also called Raft group
 
-![region](imgs/region.png)
+![image-20220721175018771](C:\Users\25344\AppData\Roaming\Typora\typora-user-images\image-20220721175018771.png)
 
 For simplicity, there would be only one Peer on a Store and one Region in a cluster for project2. So you don’t need to consider the range of Region now. Multiple regions will be further introduced in project3.
 

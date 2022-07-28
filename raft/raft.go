@@ -19,6 +19,7 @@ import (
 	"math/rand"
 	"sort"
 
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
 	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -179,11 +180,14 @@ func newRaft(c *Config) *Raft {
 	raft.RaftLog = newLog(c.Storage)
 	raft.votes = make(map[uint64]bool)
 	raft.Prs = make(map[uint64]*Progress)
+	hardState, confState, _ := c.Storage.InitialState()
+	if len(c.peers) == 0 {
+		c.peers = confState.Nodes
+	}
 	for _, peer := range c.peers {
 		raft.votes[peer] = false
 		raft.Prs[peer] = &Progress{}
 	}
-	hardState, _, _ := c.Storage.InitialState()
 	raft.Term = hardState.Term
 	raft.Vote = hardState.Vote
 	return raft
@@ -196,6 +200,8 @@ func (r *Raft) sendAppend(to uint64) bool {
 	prevLogIndex := r.Prs[to].Next - 1
 	prevLogTerm, _ := r.RaftLog.Term(prevLogIndex)
 	aftEnts := r.RaftLog.entsAfter(prevLogIndex)
+	// log.Debug("Term %v, leader %v send AppendRPC to follower %v, prevLogIndex %v, prevLogTerm %v, ents %v", r.Term, r.id, to,
+	//	prevLogIndex, prevLogTerm, aftEnts)
 	r.msgs = append(r.msgs, pb.Message{
 		MsgType: pb.MessageType_MsgAppend,
 		From:    r.id,
@@ -224,6 +230,7 @@ func (r *Raft) sendVoteRequest(to uint64) {
 	// send request vote RPC to other raft node
 	LastLogIndex := r.RaftLog.LastIndex()
 	LastLogTerm, _ := r.RaftLog.Term(LastLogIndex)
+	// log.Debug("Term %v, candidate %v send voteRequest to peer %v", r.Term, r.id, to)
 	r.msgs = append(r.msgs, pb.Message{
 		MsgType: pb.MessageType_MsgRequestVote,
 		From:    r.id,
@@ -288,7 +295,7 @@ func (r *Raft) becomeLeader() {
 		progress.Next = r.RaftLog.LastIndex() + 1
 		progress.Match = 0
 	}
-	log.DPrintf("node %d become leader, term %d", r.id, r.Term)
+	log.Infof("node %d become leader, term %d", r.id, r.Term)
 	// propose a noop entry
 	r.Step(pb.Message{
 		MsgType: pb.MessageType_MsgPropose,
@@ -300,6 +307,10 @@ func (r *Raft) becomeLeader() {
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
+	if m.To != 0 && m.To != r.id {
+		m.To = r.id
+		// panic("send to wrong peer")
+	}
 	switch m.MsgType {
 	case pb.MessageType_MsgHup:
 		if r.State == StateLeader {
@@ -362,7 +373,9 @@ func (r *Raft) Step(m pb.Message) error {
 			return nil
 		}
 		if m.Reject {
-			if m.Term > r.Term {
+			// m.Index = 0也意味着对方的Term比本次rpc发送时携带的Term大
+			//(但是rpc返回的时候可能本节点的Term也变大了，导致错误判断并进入quickGoBackIndex)
+			if m.Term > r.Term || m.Index == 0 {
 				r.becomeFollower(m.Term, None)
 				log.DPrintf("leader %v failed to send appendEntryiesRPC to %v, its term %v is higher than leader's term %v",
 					r.id, m.From, m.Term, r.Term)
@@ -379,7 +392,7 @@ func (r *Raft) Step(m pb.Message) error {
 		r.updateCommitIndex()
 	case pb.MessageType_MsgPropose:
 		if r.State != StateLeader {
-			return nil
+			return &util.ErrNotLeader{}
 		}
 		r.RaftLog.AppendEntries(m.Entries, r.Term)
 		r.Prs[r.id].Match = r.RaftLog.LastIndex()
@@ -431,7 +444,6 @@ func (r *Raft) updateCommitIndex() {
 			r.sendAppend(peer)
 		}
 	}
-	r.RaftLog.stabled = max(r.RaftLog.stabled, r.RaftLog.committed)
 }
 
 func (r *Raft) appendEntries2Follower(m pb.Message, reply *pb.Message) {
@@ -449,8 +461,9 @@ func (r *Raft) appendEntries2Follower(m pb.Message, reply *pb.Message) {
 	prevLogTerm, _ := r.RaftLog.Term(m.Index)
 	if prevLogTerm != m.LogTerm {
 		//PrevLogIndex处的日志项的周期号不匹配
-		reply.LogTerm = prevLogTerm     // conflictTerm
-		r.RaftLog.stabled = m.Index - 1 // 产生冲突 TODO(zhengfuyu): maybe error
+		reply.LogTerm = prevLogTerm // conflictTerm
+		// 产生冲突,回退stabled TODO(zhengfuyu): maybe error
+		r.RaftLog.stabled = min(r.RaftLog.stabled, m.Index-1)
 		if m.Index == 0 {
 			reply.Index = 1
 		} else {
@@ -469,7 +482,7 @@ func (r *Raft) appendEntries2Follower(m pb.Message, reply *pb.Message) {
 		//找到不匹配的日志项，删除在它之后的所有日志项
 		myLogTerm, _ := r.RaftLog.Term(i)
 		if myLogTerm != m.Entries[i-m.Index-1].Term {
-			r.RaftLog.stabled = i - 1 // 产生冲突 TODO(zhengfuyu): maybe error
+			r.RaftLog.stabled = min(r.RaftLog.stabled, i-1) // 产生冲突 TODO(zhengfuyu): maybe error
 			r.RaftLog.ClearEntsAfter(i - 1)
 			break
 		}
@@ -486,7 +499,6 @@ func (r *Raft) appendEntries2Follower(m pb.Message, reply *pb.Message) {
 		}
 		r.RaftLog.committed = min(m.Commit, lastNewEntry)
 	}
-	r.RaftLog.stabled = max(r.RaftLog.stabled, r.RaftLog.committed)
 	reply.Index = r.RaftLog.LastIndex() // NextIndex
 	reply.Reject = false
 }
@@ -501,6 +513,8 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		Term:    r.Term,
 	}
 	r.appendEntries2Follower(m, &reply)
+	// log.Debug("Term %v, follower %v reply AppenRPC to leader %v, reject %v, conflictIndex %v, appendEnts %v", r.Term, r.id, m.From,
+	//  	reply.Reject, reply.Index, m.Entries)
 	r.msgs = append(r.msgs, reply)
 }
 
@@ -540,7 +554,9 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 			if m.LogTerm > MyLastLogTerm ||
 				(m.LogTerm == MyLastLogTerm && m.Index >= MyLastLogIndex) {
 				reject = false
+				r.electionElapsed = 0
 				r.Vote = m.From
+				log.Debug("Term %v, node %v vote for candidate %v", r.Term, r.id, m.From)
 			}
 		}
 	}
@@ -567,6 +583,10 @@ func (r *Raft) quickGoBackIndex(conflictIndex, conflictTerm, peer uint64) {
 		}
 	*/
 	r.Prs[peer].Next = conflictIndex
+	// DEBUG
+	if r.Prs[peer].Next == 0 {
+		panic("Raft::quickGoBackIndex next = 0")
+	}
 }
 
 // handleSnapshot handle Snapshot RPC request

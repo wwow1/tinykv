@@ -158,22 +158,9 @@ func (rn *RawNode) Ready() Ready {
 	if !isHardStateEqual(rn.hardState, nowHardState) {
 		ready.HardState = nowHardState
 	}
-	alreadyStabledIndex, err := rn.Raft.RaftLog.storage.LastIndex()
-	if err != nil {
-		panic("Ready::LastIndex")
-	}
 	// TODO(zhengfuyu):stabled回退的情况，是否还要考虑删除已持久化的部分日志条目？
-	if rn.Raft.RaftLog.stabled > alreadyStabledIndex {
-		for i := alreadyStabledIndex + 1; i <= rn.Raft.RaftLog.stabled; i++ {
-			ready.Entries = append(ready.Entries, rn.Raft.RaftLog.entries[i-1])
-		}
-	}
-	if rn.Raft.RaftLog.committed > rn.Raft.RaftLog.applied {
-		for i := rn.Raft.RaftLog.applied + 1; i <= rn.Raft.RaftLog.committed; i++ {
-			// TODO(zhengfuyu):加入快照以后，也许不能直接通过i-1来寻址数组中的日志条目了
-			ready.CommittedEntries = append(ready.CommittedEntries, rn.Raft.RaftLog.entries[i-1])
-		}
-	}
+	ready.Entries = rn.Raft.RaftLog.unstableEntries()
+	ready.CommittedEntries = rn.Raft.RaftLog.nextEnts()
 	ready.Messages = rn.Raft.msgs
 	return ready
 }
@@ -192,6 +179,9 @@ func (rn *RawNode) HasReady() bool {
 	if err != nil {
 		panic("HasReady::LastIndex")
 	}
+	if len(rn.Raft.msgs) != 0 {
+		return true
+	}
 	if rn.Raft.RaftLog.stabled > alreadyStabledIndex {
 		return true
 	}
@@ -208,10 +198,18 @@ func (rn *RawNode) Advance(rd Ready) {
 	if !isHardStateEqual(pb.HardState{}, rd.HardState) {
 		rn.hardState = rd.HardState
 	}
+	if len(rd.Entries) != 0 {
+		rn.Raft.RaftLog.stabled = rd.Entries[len(rd.Entries)-1].Index
+	}
 	if len(rd.CommittedEntries) != 0 {
 		rn.Raft.RaftLog.applied = max(rd.CommittedEntries[len(rd.CommittedEntries)-1].Index,
 			rn.Raft.RaftLog.applied)
 	}
+	// DEBUG
+	if len(rn.Raft.msgs) != len(rd.Messages) {
+		panic("RawNode::Advance msg num mismatch")
+	}
+	rn.Raft.msgs = make([]pb.Message, 0)
 }
 
 // GetProgress return the Progress of this node and its peers, if this

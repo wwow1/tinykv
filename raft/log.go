@@ -50,6 +50,7 @@ type RaftLog struct {
 	pendingSnapshot *pb.Snapshot
 
 	// Your Data Here (2A).
+	truncateIndex uint64
 }
 
 // newLog returns log using the given storage. It recovers the log
@@ -64,6 +65,8 @@ func newLog(storage Storage) *RaftLog {
 	raftlog.entries, _ = storage.Entries(start, end+1)
 	hardState, _, _ := storage.InitialState()
 	raftlog.committed = hardState.Commit
+	raftlog.applied = start - 1
+	raftlog.truncateIndex = start - 1
 	return raftlog
 }
 
@@ -79,15 +82,22 @@ func (l *RaftLog) unstableEntries() (ents []pb.Entry) {
 	// may update after snapshot
 	lastIndex := l.LastIndex()
 	ents = make([]pb.Entry, 0, lastIndex-l.stabled)
-	for i := l.stabled; i < lastIndex; i++ {
-		ents = append(ents, l.entries[i])
+	for i := l.stabled + 1; i <= lastIndex; i++ {
+		ents = append(ents, l.entries[i-l.firstIndexInMem()])
 	}
 	return
 }
 
+func (l *RaftLog) firstIndexInMem() uint64 {
+	if len(l.entries) > 0 {
+		return l.entries[0].Index
+	}
+	panic("RaftLog::firstIndexInMem entries is empty")
+}
+
 // 删除的日志条目一定在commit之后，所以是放在raftLog.entries中（未持久化）
 func (l *RaftLog) ClearEntsAfter(index uint64) {
-	l.entries = l.entries[:index]
+	l.entries = l.entries[:(index - l.firstIndexInMem() + 1)]
 }
 
 func (l *RaftLog) AppendEntries(entries []*pb.Entry, term uint64) {
@@ -112,8 +122,8 @@ func (l *RaftLog) AppendEntries(entries []*pb.Entry, term uint64) {
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// may update after installing snapshot module
-	for i := l.applied; i < l.committed; i++ {
-		ents = append(ents, l.entries[i])
+	for i := l.applied + 1; i <= l.committed; i++ {
+		ents = append(ents, l.entries[i-l.firstIndexInMem()])
 	}
 	return
 }
@@ -123,7 +133,7 @@ func (l *RaftLog) entsAfter(i uint64) (ents []*pb.Entry) {
 	// may update after snapshot
 	lastIndex := l.LastIndex()
 	for ; i < lastIndex; i++ {
-		ents = append(ents, &(l.entries[i]))
+		ents = append(ents, &(l.entries[i-l.firstIndexInMem()+1]))
 	}
 	return
 }
@@ -134,15 +144,15 @@ func (l *RaftLog) LastIndex() uint64 {
 	if len(l.entries) > 0 {
 		lastIndex = l.entries[len(l.entries)-1].Index
 	} else {
-		lastIndex = 0
+		lastIndex = l.truncateIndex
 	}
 	return lastIndex
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
-	if i == 0 {
-		return 0, nil
+	if len(l.entries) == 0 || i < l.firstIndexInMem() {
+		return l.storage.Term(i)
 	}
-	return l.entries[i-1].Term, nil
+	return l.entries[i-l.firstIndexInMem()].Term, nil
 }
