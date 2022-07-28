@@ -81,7 +81,6 @@ func (l *RaftLog) maybeCompact() {
 func (l *RaftLog) unstableEntries() (ents []pb.Entry) {
 	// may update after snapshot
 	lastIndex := l.LastIndex()
-	ents = make([]pb.Entry, 0, lastIndex-l.stabled)
 	for i := l.stabled + 1; i <= lastIndex; i++ {
 		ents = append(ents, l.entries[i-l.firstIndexInMem()])
 	}

@@ -307,10 +307,6 @@ func (r *Raft) becomeLeader() {
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
-	if m.To != 0 && m.To != r.id {
-		m.To = r.id
-		// panic("send to wrong peer")
-	}
 	switch m.MsgType {
 	case pb.MessageType_MsgHup:
 		if r.State == StateLeader {
