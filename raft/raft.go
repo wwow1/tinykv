@@ -280,6 +280,9 @@ func (r *Raft) becomeCandidate() {
 	r.Term++
 	// vote for myself
 	r.Vote = r.id
+	for peer, _ := range r.Prs {
+		r.votes[peer] = false
+	}
 	r.votes[r.id] = true
 	// reset timer
 	r.electionElapsed = 0
@@ -307,6 +310,10 @@ func (r *Raft) becomeLeader() {
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
+	if m.To != 0 && m.To != r.id {
+		// DEBUG
+		m.To = r.id
+	}
 	switch m.MsgType {
 	case pb.MessageType_MsgHup:
 		if r.State == StateLeader {
@@ -314,6 +321,7 @@ func (r *Raft) Step(m pb.Message) error {
 		}
 		r.becomeCandidate()
 		r.electionRejectNum = 0
+		// log.Debug("Term %v, peer %v become candidate, and start a leaderElection", r.Term, r.id)
 		for peer, _ := range r.Prs {
 			if peer == r.id {
 				// only 1 raft node in whole cluster
@@ -327,7 +335,6 @@ func (r *Raft) Step(m pb.Message) error {
 		}
 	case pb.MessageType_MsgBeat:
 		if r.State != StateLeader {
-			// ignore it
 			return nil
 		}
 		for peer, _ := range r.Prs {
@@ -382,6 +389,12 @@ func (r *Raft) Step(m pb.Message) error {
 					r.id, m.From, r.Prs[m.From].Next)
 			}
 			return nil
+		}
+		if r.State != StateLeader {
+			return nil
+		}
+		if m.Index > r.RaftLog.LastIndex()+1 {
+			panic("Raft::Step reply.Index > myLastIndex")
 		}
 		r.Prs[m.From].Match = max(r.Prs[m.From].Match, m.Index)
 		r.Prs[m.From].Next = max(r.Prs[m.From].Next, m.Index+1)
@@ -552,7 +565,8 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 				reject = false
 				r.electionElapsed = 0
 				r.Vote = m.From
-				log.Debug("Term %v, node %v vote for candidate %v", r.Term, r.id, m.From)
+				// log.Debug("Term %v, node %v vote for candidate %v {m.Index = %v, m.LogTerm = %v, m.Term = %v},{myLastLogIndex = %v, myLastLogTerm = %v}",
+				// 	r.Term, r.id, m.From, m.Index, m.LogTerm, m.Term, MyLastLogIndex, MyLastLogTerm)
 			}
 		}
 	}

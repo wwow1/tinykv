@@ -60,10 +60,7 @@ func (d *peerMsgHandler) processEntry(ent eraftpb.Entry) {
 			}
 		}
 	}
-	// 重复执行某个命令 or NOOP条目
-	if cb == nil {
-		return
-	}
+	// log.Infof("node %v apply ent{%v}", d.peer.Meta.Id, ent)
 	// TODO(zhengfuyu):会存在多个request吗？
 	for _, req := range reqs.Requests {
 		switch req.CmdType {
@@ -93,10 +90,14 @@ func (d *peerMsgHandler) processEntry(ent eraftpb.Entry) {
 				{CmdType: raft_cmdpb.CmdType_Snap,
 					Snap: &raft_cmdpb.SnapResponse{Region: d.Region()}},
 			}
-			cb.Txn = d.ctx.engine.Kv.NewTransaction(false)
+			if cb != nil {
+				cb.Txn = d.ctx.engine.Kv.NewTransaction(false)
+			}
 		case raft_cmdpb.CmdType_Invalid:
 			panic("peerMsgHandler::processEntry CmdType_Invalid")
+		default:
 		}
+
 	}
 	if ent.Index > d.peerStorage.applyState.AppliedIndex {
 		err := kvWB.SetMeta(meta.RaftStateKey(d.regionId), d.peerStorage.applyState)
@@ -270,10 +271,6 @@ func (d *peerMsgHandler) ScheduleCompactLog(truncatedIndex uint64) {
 func (d *peerMsgHandler) onRaftMsg(msg *rspb.RaftMessage) error {
 	log.Debugf("%s handle raft message %s from %d to %d",
 		d.Tag, msg.GetMessage().GetMsgType(), msg.GetFromPeer().GetId(), msg.GetToPeer().GetId())
-	// DEBUG
-	if msg.GetMessage().To != d.PeerId() {
-		msg.Message.To = msg.ToPeer.Id
-	}
 	if !d.validateRaftMessage(msg) {
 		return nil
 	}

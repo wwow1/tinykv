@@ -17,6 +17,7 @@ package raft
 import (
 	"errors"
 
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -158,6 +159,9 @@ func (rn *RawNode) Ready() Ready {
 	if !isHardStateEqual(rn.hardState, nowHardState) {
 		ready.HardState = nowHardState
 	}
+	if rn.Raft.RaftLog.committed > rn.Raft.RaftLog.LastIndex() {
+		panic("on no")
+	}
 	// TODO(zhengfuyu):stabled回退的情况，是否还要考虑删除已持久化的部分日志条目？
 	ready.Entries = rn.Raft.RaftLog.unstableEntries()
 	ready.CommittedEntries = rn.Raft.RaftLog.nextEnts()
@@ -171,6 +175,15 @@ func (rn *RawNode) HasReady() bool {
 		Term:   rn.Raft.Term,
 		Vote:   rn.Raft.Vote,
 		Commit: rn.Raft.RaftLog.committed,
+	}
+	if rn.Raft.RaftLog.committed > rn.Raft.RaftLog.LastIndex() {
+		storageLastIndex, err := rn.Raft.RaftLog.storage.LastIndex()
+		if err != nil {
+			panic("xxx")
+		}
+		log.Infof("Term %v, peer %v, committed = %v, lastIndex = %v, stabled = %v, applied = %v, storageLastIndex = %v", rn.Raft.Term, rn.Raft.id,
+			rn.Raft.RaftLog.committed, rn.Raft.RaftLog.LastIndex(), rn.Raft.RaftLog.stabled, rn.Raft.RaftLog.applied, storageLastIndex)
+		panic("ooo")
 	}
 	if !isHardStateEqual(rn.hardState, nowHardState) {
 		return true
@@ -204,10 +217,6 @@ func (rn *RawNode) Advance(rd Ready) {
 	if len(rd.CommittedEntries) != 0 {
 		rn.Raft.RaftLog.applied = max(rd.CommittedEntries[len(rd.CommittedEntries)-1].Index,
 			rn.Raft.RaftLog.applied)
-	}
-	// DEBUG
-	if len(rn.Raft.msgs) != len(rd.Messages) {
-		panic("RawNode::Advance msg num mismatch")
 	}
 	rn.Raft.msgs = make([]pb.Message, 0)
 }
