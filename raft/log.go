@@ -14,7 +14,9 @@
 
 package raft
 
-import pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+import (
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+)
 
 // RaftLog manage the log entries, its struct look like:
 //
@@ -80,6 +82,7 @@ func (l *RaftLog) maybeCompact() {
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() (ents []pb.Entry) {
 	// may update after snapshot
+	ents = make([]pb.Entry, 0)
 	lastIndex := l.LastIndex()
 	for i := l.stabled + 1; i <= lastIndex; i++ {
 		ents = append(ents, l.entries[i-l.firstIndexInMem()])

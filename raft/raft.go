@@ -190,6 +190,13 @@ func newRaft(c *Config) *Raft {
 	}
 	raft.Term = hardState.Term
 	raft.Vote = hardState.Vote
+
+	storageLastIndex, err := raft.RaftLog.storage.LastIndex()
+	if err != nil {
+		panic("xxx")
+	}
+	log.Infof("peer %v start, Term %v, committed = %v, lastIndex = %v, stabled = %v, applied = %v, storageLastIndex = %v", raft.id, raft.Term,
+		raft.RaftLog.committed, raft.RaftLog.LastIndex(), raft.RaftLog.stabled, raft.RaftLog.applied, storageLastIndex)
 	return raft
 }
 
@@ -198,6 +205,9 @@ func newRaft(c *Config) *Raft {
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
 	prevLogIndex := r.Prs[to].Next - 1
+	if prevLogIndex > r.RaftLog.LastIndex() {
+		panic("Raft::sendAppend prevLogIndex > lastIndex")
+	}
 	prevLogTerm, _ := r.RaftLog.Term(prevLogIndex)
 	aftEnts := r.RaftLog.entsAfter(prevLogIndex)
 	// log.Debug("Term %v, leader %v send AppendRPC to follower %v, prevLogIndex %v, prevLogTerm %v, ents %v", r.Term, r.id, to,
@@ -286,6 +296,7 @@ func (r *Raft) becomeCandidate() {
 	r.votes[r.id] = true
 	// reset timer
 	r.electionElapsed = 0
+	// log.Infof("Term %v, peer %v become candidate, and start a leaderElection", r.Term, r.id)
 }
 
 // becomeLeader transform this peer's state to leader
@@ -313,6 +324,8 @@ func (r *Raft) Step(m pb.Message) error {
 	if m.To != 0 && m.To != r.id {
 		// DEBUG
 		m.To = r.id
+		log.Infof("m.To(%v) != r.id(%v), m{%v}", m.To, r.id, m)
+		panic("m.To != r.id")
 	}
 	switch m.MsgType {
 	case pb.MessageType_MsgHup:
@@ -321,17 +334,17 @@ func (r *Raft) Step(m pb.Message) error {
 		}
 		r.becomeCandidate()
 		r.electionRejectNum = 0
-		// log.Debug("Term %v, peer %v become candidate, and start a leaderElection", r.Term, r.id)
 		for peer, _ := range r.Prs {
 			if peer == r.id {
 				// only 1 raft node in whole cluster
-				if len(r.Prs)/2 < 1 && r.State != StateLeader {
+				if len(r.Prs) == 1 && r.State != StateLeader {
 					r.becomeLeader()
 					return nil
 				}
 				continue
 			}
 			r.sendVoteRequest(peer)
+			// log.Infof("Term %v, peer %v send voteRequest to %v", r.Term, r.id, peer)
 		}
 	case pb.MessageType_MsgBeat:
 		if r.State != StateLeader {
@@ -356,10 +369,12 @@ func (r *Raft) Step(m pb.Message) error {
 			}
 			return nil
 		}
-		if r.State != StateCandidate {
+		if r.State != StateCandidate || r.Term != m.Term {
+			// 忽略过期的RPC应答
 			return nil
 		}
 		r.votes[m.From] = true
+		// log.Infof("Term %v, peer %v receive RequestResponse from peer %v response{%v}, votes{%v}", r.Term, r.id, m.From, m, r.votes)
 		var voteNum int
 		for _, voteGranted := range r.votes {
 			if voteGranted {
@@ -367,6 +382,7 @@ func (r *Raft) Step(m pb.Message) error {
 			}
 			if voteNum > len(r.Prs)/2 && r.State != StateLeader {
 				r.becomeLeader()
+				break
 			}
 		}
 	case pb.MessageType_MsgAppend:
@@ -390,7 +406,8 @@ func (r *Raft) Step(m pb.Message) error {
 			}
 			return nil
 		}
-		if r.State != StateLeader {
+		if r.Term != m.Term {
+			// 忽略过期的RPC应答
 			return nil
 		}
 		if m.Index > r.RaftLog.LastIndex()+1 {
@@ -519,11 +536,11 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		Reject:  true,
 		From:    r.id,
 		To:      m.From,
-		Term:    r.Term,
 	}
 	r.appendEntries2Follower(m, &reply)
 	// log.Debug("Term %v, follower %v reply AppenRPC to leader %v, reject %v, conflictIndex %v, appendEnts %v", r.Term, r.id, m.From,
 	//  	reply.Reject, reply.Index, m.Entries)
+	reply.Term = r.Term
 	r.msgs = append(r.msgs, reply)
 }
 
@@ -533,12 +550,12 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 		MsgType: pb.MessageType_MsgHeartbeatResponse,
 		Reject:  true,
 		From:    r.id,
-		To:      m.From,
-		Term:    r.Term}
+		To:      m.From}
 	if r.CheckTerm(m.Term, m.From) {
 		reply.Reject = false
 		r.electionElapsed = 0
 	}
+	reply.Term = r.Term
 	r.msgs = append(r.msgs, reply)
 }
 
@@ -556,20 +573,20 @@ func (r *Raft) CheckTerm(peerTerm uint64, lead uint64) bool {
 // handleRequestVote handle RequestVote RPC request
 func (r *Raft) handleRequestVote(m pb.Message) {
 	reject := true
+	MyLastLogIndex := r.RaftLog.LastIndex()
+	MyLastLogTerm, _ := r.RaftLog.Term(MyLastLogIndex)
 	if r.CheckTerm(m.Term, None) {
-		MyLastLogIndex := r.RaftLog.LastIndex()
-		MyLastLogTerm, _ := r.RaftLog.Term(MyLastLogIndex)
 		if r.Vote == 0 || r.Vote == m.From {
 			if m.LogTerm > MyLastLogTerm ||
 				(m.LogTerm == MyLastLogTerm && m.Index >= MyLastLogIndex) {
 				reject = false
 				r.electionElapsed = 0
 				r.Vote = m.From
-				// log.Debug("Term %v, node %v vote for candidate %v {m.Index = %v, m.LogTerm = %v, m.Term = %v},{myLastLogIndex = %v, myLastLogTerm = %v}",
-				// 	r.Term, r.id, m.From, m.Index, m.LogTerm, m.Term, MyLastLogIndex, MyLastLogTerm)
 			}
 		}
 	}
+	// log.Infof("Term %v, node %v REJECT{%v} to vote for candidate %v {m.Index = %v, m.LogTerm = %v, m.Term = %v},{myLastLogIndex = %v, myLastLogTerm = %v}, m{%v}",
+	// 	r.Term, r.id, reject, m.From, m.Index, m.LogTerm, m.Term, MyLastLogIndex, MyLastLogTerm, m)
 	r.msgs = append(r.msgs, pb.Message{
 		MsgType: pb.MessageType_MsgRequestVoteResponse,
 		Reject:  reject,

@@ -120,17 +120,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		if err != nil {
 			panic("peerMsgHandler::HandleRaftReady SaveReadyState")
 		}
-		for _, msg := range rd.Messages {
-			toPeer := d.getPeerFromCache(msg.To)
-			raftMsg := &rspb.RaftMessage{
-				RegionId:    d.regionId,
-				FromPeer:    d.Meta,
-				ToPeer:      toPeer,
-				Message:     (&msg),
-				RegionEpoch: d.Region().RegionEpoch}
-			// log.Debug("peer %v send msg{%v} to peer %v", raftMsg.FromPeer.Id, msg, raftMsg.ToPeer.Id)
-			d.ctx.trans.Send(raftMsg)
-		}
+		d.Send(d.ctx.trans, rd.Messages)
 		for _, ent := range rd.CommittedEntries {
 			d.processEntry(ent)
 		}

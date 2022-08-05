@@ -150,7 +150,11 @@ func (rn *RawNode) Step(m pb.Message) error {
 
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
-	ready := Ready{Entries: []pb.Entry{}, CommittedEntries: []pb.Entry{}}
+	ready := Ready{
+		Entries:          rn.Raft.RaftLog.unstableEntries(),
+		CommittedEntries: rn.Raft.RaftLog.nextEnts(),
+		Messages:         rn.Raft.msgs,
+	}
 	nowHardState := pb.HardState{
 		Term:   rn.Raft.Term,
 		Vote:   rn.Raft.Vote,
@@ -162,10 +166,6 @@ func (rn *RawNode) Ready() Ready {
 	if rn.Raft.RaftLog.committed > rn.Raft.RaftLog.LastIndex() {
 		panic("on no")
 	}
-	// TODO(zhengfuyu):stabled回退的情况，是否还要考虑删除已持久化的部分日志条目？
-	ready.Entries = rn.Raft.RaftLog.unstableEntries()
-	ready.CommittedEntries = rn.Raft.RaftLog.nextEnts()
-	ready.Messages = rn.Raft.msgs
 	return ready
 }
 
@@ -185,20 +185,14 @@ func (rn *RawNode) HasReady() bool {
 			rn.Raft.RaftLog.committed, rn.Raft.RaftLog.LastIndex(), rn.Raft.RaftLog.stabled, rn.Raft.RaftLog.applied, storageLastIndex)
 		panic("ooo")
 	}
-	if !isHardStateEqual(rn.hardState, nowHardState) {
-		return true
-	}
 	alreadyStabledIndex, err := rn.Raft.RaftLog.storage.LastIndex()
 	if err != nil {
 		panic("HasReady::LastIndex")
 	}
-	if len(rn.Raft.msgs) != 0 {
-		return true
-	}
-	if rn.Raft.RaftLog.stabled > alreadyStabledIndex {
-		return true
-	}
-	if rn.Raft.RaftLog.committed > rn.Raft.RaftLog.applied {
+	if len(rn.Raft.msgs) != 0 ||
+		rn.Raft.RaftLog.stabled > alreadyStabledIndex ||
+		rn.Raft.RaftLog.committed > rn.Raft.RaftLog.applied ||
+		!isHardStateEqual(rn.hardState, nowHardState) {
 		return true
 	}
 	return false
@@ -219,6 +213,18 @@ func (rn *RawNode) Advance(rd Ready) {
 			rn.Raft.RaftLog.applied)
 	}
 	rn.Raft.msgs = make([]pb.Message, 0)
+	/*
+		for _, msg := range rd.Messages {
+			if msg.MsgType == eraftpb.MessageType_MsgRequestVote {
+				log.Infof("Term %v, peer %v send voteRequest to %v msg{%v}", rn.Raft.Term, msg.From, msg.To, msg)
+			}
+		}
+		StorageLastIndex, _ := rn.Raft.RaftLog.storage.LastIndex()
+		if rn.hardState.Commit > StorageLastIndex {
+			log.Infof("Commit = %v, StorageLastIndex = %v, volatile_lastIndex = %v rd{%v}", rn.hardState.Commit, StorageLastIndex, rn.Raft.RaftLog.LastIndex(), rd)
+			panic("advance")
+		}
+	*/
 }
 
 // GetProgress return the Progress of this node and its peers, if this
