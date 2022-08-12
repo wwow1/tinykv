@@ -163,8 +163,8 @@ func (rn *RawNode) Ready() Ready {
 	if !isHardStateEqual(rn.hardState, nowHardState) {
 		ready.HardState = nowHardState
 	}
-	if rn.Raft.RaftLog.committed > rn.Raft.RaftLog.LastIndex() {
-		panic("on no")
+	if rn.Raft.RaftLog.pendingSnapshot != nil {
+		ready.Snapshot = *rn.Raft.RaftLog.pendingSnapshot
 	}
 	return ready
 }
@@ -176,14 +176,11 @@ func (rn *RawNode) HasReady() bool {
 		Vote:   rn.Raft.Vote,
 		Commit: rn.Raft.RaftLog.committed,
 	}
+	// DEBUG
 	if rn.Raft.RaftLog.committed > rn.Raft.RaftLog.LastIndex() {
-		storageLastIndex, err := rn.Raft.RaftLog.storage.LastIndex()
-		if err != nil {
-			panic("xxx")
-		}
+		storageLastIndex, _ := rn.Raft.RaftLog.storage.LastIndex()
 		log.Infof("Term %v, peer %v, committed = %v, lastIndex = %v, stabled = %v, applied = %v, storageLastIndex = %v", rn.Raft.Term, rn.Raft.id,
 			rn.Raft.RaftLog.committed, rn.Raft.RaftLog.LastIndex(), rn.Raft.RaftLog.stabled, rn.Raft.RaftLog.applied, storageLastIndex)
-		panic("ooo")
 	}
 	alreadyStabledIndex, err := rn.Raft.RaftLog.storage.LastIndex()
 	if err != nil {
@@ -192,7 +189,8 @@ func (rn *RawNode) HasReady() bool {
 	if len(rn.Raft.msgs) != 0 ||
 		rn.Raft.RaftLog.stabled > alreadyStabledIndex ||
 		rn.Raft.RaftLog.committed > rn.Raft.RaftLog.applied ||
-		!isHardStateEqual(rn.hardState, nowHardState) {
+		!isHardStateEqual(rn.hardState, nowHardState) ||
+		rn.Raft.RaftLog.pendingSnapshot != nil {
 		return true
 	}
 	return false
@@ -212,19 +210,12 @@ func (rn *RawNode) Advance(rd Ready) {
 		rn.Raft.RaftLog.applied = max(rd.CommittedEntries[len(rd.CommittedEntries)-1].Index,
 			rn.Raft.RaftLog.applied)
 	}
+	if !IsEmptySnap(&rd.Snapshot) {
+		rn.Raft.RaftLog.pendingSnapshot = nil
+	}
+	// 在Compact 以及 applySnapshot之后，都需要将内存中的日志给截断
+	rn.Raft.RaftLog.maybeCompact()
 	rn.Raft.msgs = make([]pb.Message, 0)
-	/*
-		for _, msg := range rd.Messages {
-			if msg.MsgType == eraftpb.MessageType_MsgRequestVote {
-				log.Infof("Term %v, peer %v send voteRequest to %v msg{%v}", rn.Raft.Term, msg.From, msg.To, msg)
-			}
-		}
-		StorageLastIndex, _ := rn.Raft.RaftLog.storage.LastIndex()
-		if rn.hardState.Commit > StorageLastIndex {
-			log.Infof("Commit = %v, StorageLastIndex = %v, volatile_lastIndex = %v rd{%v}", rn.hardState.Commit, StorageLastIndex, rn.Raft.RaftLog.LastIndex(), rd)
-			panic("advance")
-		}
-	*/
 }
 
 // GetProgress return the Progress of this node and its peers, if this

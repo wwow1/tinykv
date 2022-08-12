@@ -42,12 +42,7 @@ func newPeerMsgHandler(peer *peer, ctx *GlobalContext) *peerMsgHandler {
 	}
 }
 
-func (d *peerMsgHandler) processEntry(ent eraftpb.Entry) {
-	var reqs raft_cmdpb.RaftCmdRequest
-	proto.Unmarshal(ent.Data, &reqs)
-	var kvWB engine_util.WriteBatch
-	var cb *message.Callback = nil
-	resp := raft_cmdpb.RaftCmdResponse{Header: newCmdResp().Header}
+func (d *peerMsgHandler) findProposal(ent *eraftpb.Entry) (cb *message.Callback) {
 	for idx, proposal := range d.proposals {
 		if proposal.index == ent.Index {
 			if proposal.term != ent.Term {
@@ -56,13 +51,15 @@ func (d *peerMsgHandler) processEntry(ent eraftpb.Entry) {
 			} else {
 				cb = proposal.cb
 				d.proposals = append(d.proposals[:idx], d.proposals[idx+1:]...)
-				break
+				return
 			}
 		}
 	}
-	// log.Infof("node %v apply ent{%v}", d.peer.Meta.Id, ent)
-	// TODO(zhengfuyu):会存在多个request吗？
-	for _, req := range reqs.Requests {
+	return nil
+}
+
+func (d *peerMsgHandler) applyRWRequest(kvWB *engine_util.WriteBatch, resp *raft_cmdpb.RaftCmdResponse, reqs []*raft_cmdpb.Request, cb *message.Callback) {
+	for _, req := range reqs {
 		switch req.CmdType {
 		case raft_cmdpb.CmdType_Delete:
 			kvWB.DeleteCF(req.Delete.Cf, req.Delete.Key)
@@ -97,11 +94,41 @@ func (d *peerMsgHandler) processEntry(ent eraftpb.Entry) {
 			panic("peerMsgHandler::processEntry CmdType_Invalid")
 		default:
 		}
-
 	}
+}
+
+func (d *peerMsgHandler) applyAdminRequest(kvWB *engine_util.WriteBatch, resp *raft_cmdpb.RaftCmdResponse, req *raft_cmdpb.AdminRequest) {
+	if req != nil {
+		switch req.CmdType {
+		case raft_cmdpb.AdminCmdType_CompactLog:
+			if d.peerStorage.applyState.TruncatedState.Index > req.CompactLog.CompactIndex {
+				log.Infof("peer %v receive a staled compactLog CMD, applyState{%v}, CompactLog{%v}", d.peer.Meta.Id, d.peerStorage.applyState, req.CompactLog)
+				return
+			}
+			// log.Infof("peer %v apply snapshot{%v}", d.peer.Meta.Id, req.CompactLog)
+			d.peerStorage.applyState.TruncatedState.Index = req.CompactLog.CompactIndex
+			d.peerStorage.applyState.TruncatedState.Term = req.CompactLog.CompactTerm
+			err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+			if err != nil {
+				panic("peerMsgHandler::applyAdminRequest SetMeta")
+			}
+			d.ScheduleCompactLog(d.peerStorage.applyState.TruncatedState.Index)
+		default:
+		}
+	}
+}
+
+func (d *peerMsgHandler) processEntry(ent eraftpb.Entry) {
+	var req raft_cmdpb.RaftCmdRequest
+	proto.Unmarshal(ent.Data, &req)
+	var kvWB engine_util.WriteBatch
+	resp := raft_cmdpb.RaftCmdResponse{Header: newCmdResp().Header}
+	cb := d.findProposal(&ent)
+	d.applyRWRequest(&kvWB, &resp, req.Requests, cb)
+	d.applyAdminRequest(&kvWB, &resp, req.AdminRequest)
 	if ent.Index > d.peerStorage.applyState.AppliedIndex {
-		err := kvWB.SetMeta(meta.RaftStateKey(d.regionId), d.peerStorage.applyState)
 		d.peerStorage.applyState.AppliedIndex = ent.Index
+		err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
 		if err != nil {
 			panic("peerMsgHandler::processEntry SetMeta")
 		}

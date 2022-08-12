@@ -200,6 +200,28 @@ func newRaft(c *Config) *Raft {
 	return raft
 }
 
+func (r *Raft) sendSnapshot(to uint64) bool {
+	snapshot, err := r.RaftLog.storage.Snapshot()
+	if err != nil {
+		if err == ErrSnapshotTemporarilyUnavailable {
+			// 第一次调用Snapshot的时候后台异步生成快照，大概要等到下一轮快照才生成完毕
+			return true
+		} else {
+			panic("Raft::sendSnapshot Snapshot")
+		}
+	}
+	r.msgs = append(r.msgs, pb.Message{
+		MsgType:  pb.MessageType_MsgSnapshot,
+		From:     r.id,
+		To:       to,
+		Term:     r.Term,
+		Snapshot: &snapshot,
+	})
+	r.Prs[to].Next = snapshot.Metadata.Index + 1
+	// snapshot没有reply msg,所以在这里就先推进Next(Next有偏差不影响正确性)
+	return true
+}
+
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
@@ -208,7 +230,14 @@ func (r *Raft) sendAppend(to uint64) bool {
 	if prevLogIndex > r.RaftLog.LastIndex() {
 		panic("Raft::sendAppend prevLogIndex > lastIndex")
 	}
-	prevLogTerm, _ := r.RaftLog.Term(prevLogIndex)
+	if prevLogIndex < r.RaftLog.truncateIndex {
+		// 发送快照
+		return r.sendSnapshot(to)
+	}
+	prevLogTerm, err := r.RaftLog.Term(prevLogIndex)
+	if err != nil {
+		panic("Raft::sendAppend Term")
+	}
 	aftEnts := r.RaftLog.entsAfter(prevLogIndex)
 	// log.Debug("Term %v, leader %v send AppendRPC to follower %v, prevLogIndex %v, prevLogTerm %v, ents %v", r.Term, r.id, to,
 	//	prevLogIndex, prevLogTerm, aftEnts)
@@ -442,6 +471,8 @@ func (r *Raft) Step(m pb.Message) error {
 				})
 			}
 		}
+	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
 	}
 	return nil
 }
@@ -484,30 +515,46 @@ func (r *Raft) appendEntries2Follower(m pb.Message, reply *pb.Message) {
 		reply.LogTerm = None
 		return
 	}
-	prevLogTerm, _ := r.RaftLog.Term(m.Index)
-	if prevLogTerm != m.LogTerm {
-		//PrevLogIndex处的日志项的周期号不匹配
-		reply.LogTerm = prevLogTerm // conflictTerm
-		// 产生冲突,回退stabled TODO(zhengfuyu): maybe error
-		r.RaftLog.stabled = min(r.RaftLog.stabled, m.Index-1)
-		if m.Index == 0 {
-			reply.Index = 1
-		} else {
-			for i := m.Index - 1; i >= 0; i-- {
-				myLogTerm, _ := r.RaftLog.Term(i)
-				if myLogTerm < reply.LogTerm {
-					reply.Index = i + 1 // conflictIndex
-					break
+	if m.Index >= r.RaftLog.truncateIndex {
+		// 小于truncateIndex的都是已经apply的日志,一定已经满足一致性
+		prevLogTerm, err := r.RaftLog.Term(m.Index)
+		if err != nil {
+			panic("Raft::appendEntries2Follower Term1")
+		}
+		if prevLogTerm != m.LogTerm {
+			//PrevLogIndex处的日志项的周期号不匹配
+			reply.LogTerm = prevLogTerm // conflictTerm
+			r.RaftLog.stabled = min(r.RaftLog.stabled, m.Index-1)
+			if m.Index == 0 {
+				reply.Index = 1
+			} else {
+				// 寻找合适的回退点
+				reply.Index = r.RaftLog.truncateIndex - 1
+				for i := m.Index - 1; i >= r.RaftLog.truncateIndex; i-- {
+					myLogTerm, err := r.RaftLog.Term(i)
+					if err != nil {
+						panic("Raft::appendEntries2Follower Term2")
+					}
+					if myLogTerm < reply.LogTerm {
+						reply.Index = i + 1 // conflictIndex
+						break
+					}
 				}
 			}
+			return
 		}
-		return
 	}
 	leaderLastLogIndex := m.Index + uint64(len(m.Entries))
-	for i := m.Index + 1; i <= r.RaftLog.LastIndex() && i <= leaderLastLogIndex; i++ {
+	startIndex := max(m.Index+1, r.RaftLog.truncateIndex+1)
+	// startIndex是针对快照场景下的错误处理
+	// (appendEntriesRPC过迟到来，m.Entries中包含某些已经被follower截断的日志,在针对这些日志取raftLog.Term的时候会出错,需要跨过它们)
+	for i := startIndex; i <= r.RaftLog.LastIndex() && i <= leaderLastLogIndex; i++ {
 		//找到不匹配的日志项，删除在它之后的所有日志项
-		myLogTerm, _ := r.RaftLog.Term(i)
-		if myLogTerm != m.Entries[i-m.Index-1].Term {
+		myLogTerm, err := r.RaftLog.Term(i)
+		if err != nil {
+			panic("Raft::appendEntries2Follower Term3")
+		}
+		if myLogTerm != m.Entries[i-startIndex].Term {
 			r.RaftLog.stabled = min(r.RaftLog.stabled, i-1) // 产生冲突 TODO(zhengfuyu): maybe error
 			r.RaftLog.ClearEntsAfter(i - 1)
 			break
@@ -518,12 +565,12 @@ func (r *Raft) appendEntries2Follower(m pb.Message, reply *pb.Message) {
 		r.RaftLog.AppendEntries(m.Entries[r.RaftLog.LastIndex()-m.Index:], r.Term)
 	}
 	// 更新commitIndex
-	if m.Commit > r.RaftLog.committed {
-		lastNewEntry := m.Index
-		if len(m.Entries) != 0 {
-			lastNewEntry = m.Entries[len(m.Entries)-1].Index
-		}
-		r.RaftLog.committed = min(m.Commit, lastNewEntry)
+	consistentLogIndex := m.Index
+	if len(m.Entries) != 0 {
+		consistentLogIndex = m.Entries[len(m.Entries)-1].Index
+	}
+	if consistentLogIndex > r.RaftLog.committed {
+		r.RaftLog.committed = min(m.Commit, consistentLogIndex)
 	}
 	reply.Index = r.RaftLog.LastIndex() // NextIndex
 	reply.Reject = false
@@ -619,6 +666,18 @@ func (r *Raft) quickGoBackIndex(conflictIndex, conflictTerm, peer uint64) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	if r.CheckTerm(m.Term, m.From) {
+		r.electionElapsed = 0
+		r.RaftLog.pendingSnapshot = m.Snapshot
+		r.RaftLog.updateTruncateMeta(m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term)
+		// 更新集群信息
+		r.votes = make(map[uint64]bool)
+		r.Prs = make(map[uint64]*Progress)
+		for _, peer := range m.Snapshot.Metadata.ConfState.Nodes {
+			r.votes[peer] = false
+			r.Prs[peer] = &Progress{}
+		}
+	}
 }
 
 // addNode add a new node to raft group

@@ -15,6 +15,7 @@
 package raft
 
 import (
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -51,8 +52,8 @@ type RaftLog struct {
 	// (Used in 2C)
 	pendingSnapshot *pb.Snapshot
 
-	// Your Data Here (2A).
 	truncateIndex uint64
+	truncateTerm  uint64
 }
 
 // newLog returns log using the given storage. It recovers the log
@@ -61,15 +62,41 @@ func newLog(storage Storage) *RaftLog {
 	// Your Code Here (2A).
 	raftlog := &RaftLog{}
 	raftlog.storage = storage
-	raftlog.stabled, _ = storage.LastIndex()
-	start, _ := storage.FirstIndex()
-	end, _ := storage.LastIndex()
-	raftlog.entries, _ = storage.Entries(start, end+1)
+	firstIndex, err := storage.FirstIndex()
+	if err != nil {
+		panic("RaftLog::newLog FirstIndex")
+	}
+	raftlog.stabled, err = storage.LastIndex()
+	if err != nil {
+		panic("RaftLog::newLog LastIndex")
+	}
+	raftlog.truncateIndex = firstIndex - 1
+	raftlog.truncateTerm, err = storage.Term(raftlog.truncateIndex)
+	if err != nil {
+		panic("RaftLog::newLog Term")
+	}
+	raftlog.entries, _ = storage.Entries(firstIndex, raftlog.stabled+1)
 	hardState, _, _ := storage.InitialState()
 	raftlog.committed = hardState.Commit
-	raftlog.applied = start - 1
-	raftlog.truncateIndex = start - 1
+	raftlog.applied = raftlog.truncateIndex
 	return raftlog
+}
+
+func (l *RaftLog) updateTruncateMeta(truncatedIndex, truncatedTerm uint64) {
+	if l.truncateIndex > truncatedIndex {
+		panic("RaftLog::MaybeCompact MytruncateIndex > compactIndex")
+	}
+	l.truncateIndex = truncatedIndex
+	l.truncateTerm = truncatedTerm
+	if l.applied < truncatedIndex {
+		l.applied = truncatedIndex
+	}
+	if l.committed < truncatedIndex {
+		l.committed = truncatedIndex
+	}
+	if l.stabled < truncatedIndex {
+		l.stabled = truncatedIndex
+	}
 }
 
 // We need to compact the log entries in some point of time like
@@ -77,6 +104,22 @@ func newLog(storage Storage) *RaftLog {
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
+	if len(l.entries) == 0 || l.truncateIndex < l.firstIndexInMem() {
+		// 不需要裁剪日志
+		return
+	}
+	if l.LastIndex() <= l.truncateIndex {
+		// 裁剪所有日志条目
+		l.entries = make([]pb.Entry, 0)
+	} else {
+		// 裁剪部分日志条目
+		for idx, ent := range l.entries {
+			if ent.Index == l.truncateIndex {
+				l.entries = l.entries[idx+1:]
+				return
+			}
+		}
+	}
 }
 
 // unstableEntries return all the unstable entries
@@ -153,8 +196,14 @@ func (l *RaftLog) LastIndex() uint64 {
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
-	if len(l.entries) == 0 || i < l.firstIndexInMem() {
+	if i == l.truncateIndex {
+		return l.truncateTerm, nil
+	}
+	if i < l.truncateIndex {
 		return l.storage.Term(i)
+	}
+	if i-l.firstIndexInMem() >= (uint64)(len(l.entries)) {
+		log.Infof("i{%v}, lastEntryIndex{%v}, truncateIndex{%v}", i, l.LastIndex(), l.truncateIndex)
 	}
 	return l.entries[i-l.firstIndexInMem()].Term, nil
 }
