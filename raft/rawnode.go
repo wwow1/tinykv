@@ -17,7 +17,6 @@ package raft
 import (
 	"errors"
 
-	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -176,12 +175,13 @@ func (rn *RawNode) HasReady() bool {
 		Vote:   rn.Raft.Vote,
 		Commit: rn.Raft.RaftLog.committed,
 	}
-	// DEBUG
-	if rn.Raft.RaftLog.committed > rn.Raft.RaftLog.LastIndex() {
-		storageLastIndex, _ := rn.Raft.RaftLog.storage.LastIndex()
-		log.Infof("Term %v, peer %v, committed = %v, lastIndex = %v, stabled = %v, applied = %v, storageLastIndex = %v", rn.Raft.Term, rn.Raft.id,
-			rn.Raft.RaftLog.committed, rn.Raft.RaftLog.LastIndex(), rn.Raft.RaftLog.stabled, rn.Raft.RaftLog.applied, storageLastIndex)
-	}
+	/*
+		if rn.Raft.RaftLog.committed > rn.Raft.RaftLog.LastIndex() {
+			storageLastIndex, _ := rn.Raft.RaftLog.storage.LastIndex()
+			log.Infof("Term %v, peer %v, committed = %v, lastIndex = %v, stabled = %v, applied = %v, storageLastIndex = %v", rn.Raft.Term, rn.Raft.id,
+				rn.Raft.RaftLog.committed, rn.Raft.RaftLog.LastIndex(), rn.Raft.RaftLog.stabled, rn.Raft.RaftLog.applied, storageLastIndex)
+		}
+	*/
 	alreadyStabledIndex, err := rn.Raft.RaftLog.storage.LastIndex()
 	if err != nil {
 		panic("HasReady::LastIndex")
@@ -209,6 +209,9 @@ func (rn *RawNode) Advance(rd Ready) {
 	if len(rd.CommittedEntries) != 0 {
 		rn.Raft.RaftLog.applied = max(rd.CommittedEntries[len(rd.CommittedEntries)-1].Index,
 			rn.Raft.RaftLog.applied)
+		if rn.Raft.RaftLog.applied > rn.Raft.RaftLog.committed {
+			panic('x')
+		}
 	}
 	if !IsEmptySnap(&rd.Snapshot) {
 		rn.Raft.RaftLog.pendingSnapshot = nil

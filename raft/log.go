@@ -83,6 +83,7 @@ func newLog(storage Storage) *RaftLog {
 }
 
 func (l *RaftLog) updateTruncateMeta(truncatedIndex, truncatedTerm uint64) {
+	// follower接收到快照时需要更新内存中的一些元信息（私以为在advance中调用更好，但是3c的test要求在handleSnapshot中完成）
 	if l.truncateIndex > truncatedIndex {
 		panic("RaftLog::MaybeCompact MytruncateIndex > compactIndex")
 	}
@@ -123,14 +124,12 @@ func (l *RaftLog) maybeCompact() {
 }
 
 // unstableEntries return all the unstable entries
-func (l *RaftLog) unstableEntries() (ents []pb.Entry) {
-	// may update after snapshot
-	ents = make([]pb.Entry, 0)
-	lastIndex := l.LastIndex()
-	for i := l.stabled + 1; i <= lastIndex; i++ {
-		ents = append(ents, l.entries[i-l.firstIndexInMem()])
+func (l *RaftLog) unstableEntries() []pb.Entry {
+	// handleSnapshot到maybeCompact期间, applied,commit,stabled会有部分不一致状态（大于lastIndex）
+	if len(l.entries) == 0 || l.stabled >= l.LastIndex() {
+		return []pb.Entry{}
 	}
-	return
+	return l.entries[l.stabled+1-l.firstIndexInMem():]
 }
 
 func (l *RaftLog) firstIndexInMem() uint64 {
@@ -185,13 +184,10 @@ func (l *RaftLog) entsAfter(i uint64) (ents []*pb.Entry) {
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
-	var lastIndex uint64
-	if len(l.entries) > 0 {
-		lastIndex = l.entries[len(l.entries)-1].Index
-	} else {
-		lastIndex = l.truncateIndex
+	if len(l.entries) == 0 {
+		return l.truncateIndex
 	}
-	return lastIndex
+	return l.entries[len(l.entries)-1].Index
 }
 
 // Term return the term of the entry in the given index
@@ -202,8 +198,9 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	if i < l.truncateIndex {
 		return l.storage.Term(i)
 	}
+	// DEBUG
 	if i-l.firstIndexInMem() >= (uint64)(len(l.entries)) {
-		log.Infof("i{%v}, lastEntryIndex{%v}, truncateIndex{%v}", i, l.LastIndex(), l.truncateIndex)
+		log.Debug("i{%v}, lastEntryIndex{%v}, truncateIndex{%v}", i, l.LastIndex(), l.truncateIndex)
 	}
 	return l.entries[i-l.firstIndexInMem()].Term, nil
 }

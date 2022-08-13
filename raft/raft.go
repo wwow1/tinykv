@@ -19,7 +19,6 @@ import (
 	"math/rand"
 	"sort"
 
-	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
 	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -325,7 +324,7 @@ func (r *Raft) becomeCandidate() {
 	r.votes[r.id] = true
 	// reset timer
 	r.electionElapsed = 0
-	// log.Infof("Term %v, peer %v become candidate, and start a leaderElection", r.Term, r.id)
+	// log.Debug("Term %v, peer %v become candidate, and start a leaderElection", r.Term, r.id)
 }
 
 // becomeLeader transform this peer's state to leader
@@ -350,127 +349,25 @@ func (r *Raft) becomeLeader() {
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
-	if m.To != 0 && m.To != r.id {
-		// DEBUG
-		m.To = r.id
-		log.Infof("m.To(%v) != r.id(%v), m{%v}", m.To, r.id, m)
-		panic("m.To != r.id")
-	}
 	switch m.MsgType {
 	case pb.MessageType_MsgHup:
-		if r.State == StateLeader {
-			return nil
-		}
-		r.becomeCandidate()
-		r.electionRejectNum = 0
-		for peer, _ := range r.Prs {
-			if peer == r.id {
-				// only 1 raft node in whole cluster
-				if len(r.Prs) == 1 && r.State != StateLeader {
-					r.becomeLeader()
-					return nil
-				}
-				continue
-			}
-			r.sendVoteRequest(peer)
-			// log.Infof("Term %v, peer %v send voteRequest to %v", r.Term, r.id, peer)
-		}
+		r.handleMsgHup(m)
 	case pb.MessageType_MsgBeat:
-		if r.State != StateLeader {
-			return nil
-		}
-		for peer, _ := range r.Prs {
-			if peer == r.id {
-				continue
-			}
-			r.sendHeartbeat(peer)
-		}
+		r.handleMsgBeat(m)
 	case pb.MessageType_MsgRequestVote:
 		r.handleRequestVote(m)
 	case pb.MessageType_MsgRequestVoteResponse:
-		if m.Reject {
-			if m.Term > r.Term {
-				r.becomeFollower(m.Term, None)
-			}
-			r.electionRejectNum++
-			if r.electionRejectNum > uint64(len(r.Prs)/2) {
-				r.becomeFollower(r.Term, None)
-			}
-			return nil
-		}
-		if r.State != StateCandidate || r.Term != m.Term {
-			// 忽略过期的RPC应答
-			return nil
-		}
-		r.votes[m.From] = true
-		// log.Infof("Term %v, peer %v receive RequestResponse from peer %v response{%v}, votes{%v}", r.Term, r.id, m.From, m, r.votes)
-		var voteNum int
-		for _, voteGranted := range r.votes {
-			if voteGranted {
-				voteNum++
-			}
-			if voteNum > len(r.Prs)/2 && r.State != StateLeader {
-				r.becomeLeader()
-				break
-			}
-		}
+		r.handleRequestVoteResponse(m)
 	case pb.MessageType_MsgAppend:
 		r.handleAppendEntries(m)
 	case pb.MessageType_MsgAppendResponse:
-		if r.State != StateLeader {
-			return nil
-		}
-		if m.Reject {
-			// m.Index = 0也意味着对方的Term比本次rpc发送时携带的Term大
-			//(但是rpc返回的时候可能本节点的Term也变大了，导致错误判断并进入quickGoBackIndex)
-			if m.Term > r.Term || m.Index == 0 {
-				r.becomeFollower(m.Term, None)
-				log.DPrintf("leader %v failed to send appendEntryiesRPC to %v, its term %v is higher than leader's term %v",
-					r.id, m.From, m.Term, r.Term)
-			} else {
-				r.quickGoBackIndex(m.Index, m.LogTerm, m.From)
-				r.sendAppend(m.From)
-				log.DPrintf("leader %v failed to send appendEntryiesRPC to %v, quickGoBackIndex to %v",
-					r.id, m.From, r.Prs[m.From].Next)
-			}
-			return nil
-		}
-		if r.Term != m.Term {
-			// 忽略过期的RPC应答
-			return nil
-		}
-		if m.Index > r.RaftLog.LastIndex()+1 {
-			panic("Raft::Step reply.Index > myLastIndex")
-		}
-		r.Prs[m.From].Match = max(r.Prs[m.From].Match, m.Index)
-		r.Prs[m.From].Next = max(r.Prs[m.From].Next, m.Index+1)
-		r.updateCommitIndex()
+		r.handleAppendEntriesResponse(m)
 	case pb.MessageType_MsgPropose:
-		if r.State != StateLeader {
-			return &util.ErrNotLeader{}
-		}
-		r.RaftLog.AppendEntries(m.Entries, r.Term)
-		r.Prs[r.id].Match = r.RaftLog.LastIndex()
-		r.Prs[r.id].Next = r.Prs[r.id].Match + 1
-		for peer, _ := range r.Prs {
-			if peer == r.id {
-				r.updateCommitIndex()
-				continue
-			}
-			r.sendAppend(peer)
-		}
+		r.handlePropose(m)
 	case pb.MessageType_MsgHeartbeat:
 		r.handleHeartbeat(m)
 	case pb.MessageType_MsgHeartbeatResponse:
-		if !m.Reject {
-			// follower的日志落后了，马上发送AppendEntriesRPC推进follower的日志
-			if r.Prs[m.From].Match < r.RaftLog.LastIndex() {
-				r.Step(pb.Message{
-					MsgType: pb.MessageType_MsgPropose,
-					Entries: []*pb.Entry{},
-				})
-			}
-		}
+		r.handleHeartbeatResponse(m)
 	case pb.MessageType_MsgSnapshot:
 		r.handleSnapshot(m)
 	}
@@ -591,6 +488,53 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	r.msgs = append(r.msgs, reply)
 }
 
+func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
+	if r.State != StateLeader {
+		return
+	}
+	if m.Reject {
+		// m.Index = 0也意味着对方的Term比本次rpc发送时携带的Term大
+		//(但是rpc返回的时候可能本节点的Term也变大了，导致错误判断并回退index)
+		if m.Term > r.Term || m.Index == 0 {
+			r.becomeFollower(m.Term, None)
+			log.DPrintf("leader %v failed to send appendEntryiesRPC to %v, its term %v is higher than leader's term %v",
+				r.id, m.From, m.Term, r.Term)
+		} else {
+			r.Prs[m.From].Next = m.Index
+			r.sendAppend(m.From)
+			log.DPrintf("leader %v failed to send appendEntryiesRPC to %v, quickGoBackIndex to %v",
+				r.id, m.From, r.Prs[m.From].Next)
+		}
+		return
+	}
+	if r.Term != m.Term {
+		// 忽略过期的RPC应答
+		return
+	}
+	if m.Index > r.RaftLog.LastIndex()+1 {
+		panic("Raft::Step reply.Index > myLastIndex")
+	}
+	r.Prs[m.From].Match = max(r.Prs[m.From].Match, m.Index)
+	r.Prs[m.From].Next = max(r.Prs[m.From].Next, m.Index+1)
+	r.updateCommitIndex()
+}
+
+func (r *Raft) handlePropose(m pb.Message) {
+	if r.State != StateLeader {
+		return
+	}
+	r.RaftLog.AppendEntries(m.Entries, r.Term)
+	r.Prs[r.id].Match = r.RaftLog.LastIndex()
+	r.Prs[r.id].Next = r.Prs[r.id].Match + 1
+	for peer, _ := range r.Prs {
+		if peer == r.id {
+			r.updateCommitIndex()
+			continue
+		}
+		r.sendAppend(peer)
+	}
+}
+
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	reply := pb.Message{
@@ -604,6 +548,79 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 	}
 	reply.Term = r.Term
 	r.msgs = append(r.msgs, reply)
+}
+
+func (r *Raft) handleHeartbeatResponse(m pb.Message) {
+	if !m.Reject {
+		// follower的日志落后了，马上发送AppendEntriesRPC推进follower的日志
+		if r.Prs[m.From].Match < r.RaftLog.LastIndex() {
+			r.Step(pb.Message{
+				MsgType: pb.MessageType_MsgPropose,
+				Entries: []*pb.Entry{},
+			})
+		}
+	}
+}
+
+func (r *Raft) handleMsgHup(m pb.Message) {
+	if r.State == StateLeader {
+		return
+	}
+	r.becomeCandidate()
+	r.electionRejectNum = 0
+	for peer, _ := range r.Prs {
+		if peer == r.id {
+			// only 1 raft node in whole cluster
+			if len(r.Prs) == 1 && r.State != StateLeader {
+				r.becomeLeader()
+				return
+			}
+			continue
+		}
+		r.sendVoteRequest(peer)
+		// log.Debug("Term %v, peer %v send voteRequest to %v", r.Term, r.id, peer)
+	}
+}
+
+func (r *Raft) handleMsgBeat(m pb.Message) {
+	if r.State != StateLeader {
+		return
+	}
+	for peer, _ := range r.Prs {
+		if peer == r.id {
+			continue
+		}
+		r.sendHeartbeat(peer)
+	}
+}
+
+func (r *Raft) handleRequestVoteResponse(m pb.Message) {
+	if m.Reject {
+		if m.Term > r.Term {
+			r.becomeFollower(m.Term, None)
+		}
+		r.electionRejectNum++
+		if r.electionRejectNum > uint64(len(r.Prs)/2) {
+			r.becomeFollower(r.Term, None)
+		}
+		return
+	}
+	if r.State != StateCandidate || r.Term != m.Term {
+		// 忽略过期的RPC应答
+		return
+	}
+	r.votes[m.From] = true
+	// log.Debug("Term %v, peer %v receive RequestResponse from peer %v response{%v}, votes{%v}", r.Term, r.id, m.From, m, r.votes)
+	var voteNum int
+	for _, voteGranted := range r.votes {
+		if voteGranted {
+			voteNum++
+		}
+		if voteNum > len(r.Prs)/2 && r.State != StateLeader {
+			r.becomeLeader()
+			break
+		}
+	}
 }
 
 func (r *Raft) CheckTerm(peerTerm uint64, lead uint64) bool {
@@ -632,7 +649,7 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 			}
 		}
 	}
-	// log.Infof("Term %v, node %v REJECT{%v} to vote for candidate %v {m.Index = %v, m.LogTerm = %v, m.Term = %v},{myLastLogIndex = %v, myLastLogTerm = %v}, m{%v}",
+	// log.Debug("Term %v, node %v REJECT{%v} to vote for candidate %v {m.Index = %v, m.LogTerm = %v, m.Term = %v},{myLastLogIndex = %v, myLastLogTerm = %v}, m{%v}",
 	// 	r.Term, r.id, reject, m.From, m.Index, m.LogTerm, m.Term, MyLastLogIndex, MyLastLogTerm, m)
 	r.msgs = append(r.msgs, pb.Message{
 		MsgType: pb.MessageType_MsgRequestVoteResponse,
@@ -641,26 +658,6 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 		To:      m.From,
 		Term:    r.Term,
 	})
-}
-
-func (r *Raft) quickGoBackIndex(conflictIndex, conflictTerm, peer uint64) {
-	/*
-		if conflictTerm != None {
-			// TODO(zhengfuyu): 二分法优化？
-			for i := r.RaftLog.LastIndex(); i > 0; i-- {
-				logTerm, _ := r.RaftLog.Term(i)
-				if logTerm < conflictTerm {
-					r.Prs[peer].Next = i + 1
-					return
-				}
-			}
-		}
-	*/
-	r.Prs[peer].Next = conflictIndex
-	// DEBUG
-	if r.Prs[peer].Next == 0 {
-		panic("Raft::quickGoBackIndex next = 0")
-	}
 }
 
 // handleSnapshot handle Snapshot RPC request

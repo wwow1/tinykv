@@ -102,10 +102,10 @@ func (d *peerMsgHandler) applyAdminRequest(kvWB *engine_util.WriteBatch, resp *r
 		switch req.CmdType {
 		case raft_cmdpb.AdminCmdType_CompactLog:
 			if d.peerStorage.applyState.TruncatedState.Index > req.CompactLog.CompactIndex {
-				log.Infof("peer %v receive a staled compactLog CMD, applyState{%v}, CompactLog{%v}", d.peer.Meta.Id, d.peerStorage.applyState, req.CompactLog)
+				log.Debug("peer %v receive a staled compactLog CMD, applyState{%v}, CompactLog{%v}", d.peer.Meta.Id, d.peerStorage.applyState, req.CompactLog)
 				return
 			}
-			// log.Infof("peer %v apply snapshot{%v}", d.peer.Meta.Id, req.CompactLog)
+			// log.Debug("peer %v apply snapshot{%v}", d.peer.Meta.Id, req.CompactLog)
 			d.peerStorage.applyState.TruncatedState.Index = req.CompactLog.CompactIndex
 			d.peerStorage.applyState.TruncatedState.Term = req.CompactLog.CompactTerm
 			err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
