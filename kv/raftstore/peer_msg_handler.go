@@ -119,22 +119,30 @@ func (d *peerMsgHandler) applyAdminRequest(kvWB *engine_util.WriteBatch, resp *r
 }
 
 func (d *peerMsgHandler) processEntry(ent eraftpb.Entry) {
-	var req raft_cmdpb.RaftCmdRequest
-	proto.Unmarshal(ent.Data, &req)
-	var kvWB engine_util.WriteBatch
-	resp := raft_cmdpb.RaftCmdResponse{Header: newCmdResp().Header}
-	cb := d.findProposal(&ent)
-	d.applyRWRequest(&kvWB, &resp, req.Requests, cb)
-	d.applyAdminRequest(&kvWB, &resp, req.AdminRequest)
-	if ent.Index > d.peerStorage.applyState.AppliedIndex {
-		d.peerStorage.applyState.AppliedIndex = ent.Index
-		err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
-		if err != nil {
-			panic("peerMsgHandler::processEntry SetMeta")
+	if ent.EntryType == eraftpb.EntryType_EntryNormal {
+		var req raft_cmdpb.RaftCmdRequest
+		proto.Unmarshal(ent.Data, &req)
+		var kvWB engine_util.WriteBatch
+		resp := raft_cmdpb.RaftCmdResponse{Header: newCmdResp().Header}
+		cb := d.findProposal(&ent)
+		d.applyRWRequest(&kvWB, &resp, req.Requests, cb)
+
+		d.applyAdminRequest(&kvWB, &resp, req.AdminRequest)
+		if ent.Index > d.peerStorage.applyState.AppliedIndex {
+			d.peerStorage.applyState.AppliedIndex = ent.Index
+			err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+			if err != nil {
+				panic("peerMsgHandler::processEntry SetMeta")
+			}
 		}
+		kvWB.MustWriteToDB(d.ctx.engine.Kv)
+		cb.Done(&resp)
+	} else {
+		// EntryType_EntryConfChange
+		var confChange eraftpb.ConfChange
+		proto.Unmarshal(ent.Data, &confChange)
+		d.RaftGroup.ApplyConfChange(confChange)
 	}
-	kvWB.MustWriteToDB(d.ctx.engine.Kv)
-	cb.Done(&resp)
 }
 
 func (d *peerMsgHandler) HandleRaftReady() {

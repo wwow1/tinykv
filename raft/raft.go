@@ -295,7 +295,6 @@ func (r *Raft) tick() {
 		r.electionElapsed++
 		if r.electionElapsed == r.electionTimeout {
 			r.Step(pb.Message{MsgType: pb.MessageType_MsgHup})
-			r.electionElapsed = 0
 			r.electionTimeout = rand.Intn(r.electionTimeoutBaseline) +
 				r.electionTimeoutBaseline
 		}
@@ -308,6 +307,7 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.Term = term
 	r.Lead = lead
 	r.Vote = lead
+	r.leadTransferee = None
 }
 
 // becomeCandidate transform this peer's state to candidate
@@ -324,6 +324,7 @@ func (r *Raft) becomeCandidate() {
 	r.votes[r.id] = true
 	// reset timer
 	r.electionElapsed = 0
+	r.leadTransferee = None
 	// log.Debug("Term %v, peer %v become candidate, and start a leaderElection", r.Term, r.id)
 }
 
@@ -349,6 +350,10 @@ func (r *Raft) becomeLeader() {
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
+	if _, exist := r.Prs[r.id]; !exist {
+		// 如果本节点已经被移出集群，那么不处理收到的Msg
+		return nil
+	}
 	switch m.MsgType {
 	case pb.MessageType_MsgHup:
 		r.handleMsgHup(m)
@@ -370,6 +375,10 @@ func (r *Raft) Step(m pb.Message) error {
 		r.handleHeartbeatResponse(m)
 	case pb.MessageType_MsgSnapshot:
 		r.handleSnapshot(m)
+	case pb.MessageType_MsgTransferLeader:
+		r.handleTransferLeader(m)
+	case pb.MessageType_MsgTimeoutNow:
+		r.handleTimeoutNow(m)
 	}
 	return nil
 }
@@ -378,6 +387,9 @@ func (r *Raft) updateCommitIndex() {
 	var matchArr uint64Slice
 	for _, pr := range r.Prs {
 		matchArr = append(matchArr, pr.Match)
+	}
+	if len(matchArr) == 0 {
+		return
 	}
 	sort.Sort(matchArr)
 	olderCommitted := r.RaftLog.committed
@@ -517,10 +529,15 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 	r.Prs[m.From].Match = max(r.Prs[m.From].Match, m.Index)
 	r.Prs[m.From].Next = max(r.Prs[m.From].Next, m.Index+1)
 	r.updateCommitIndex()
+	if r.leadTransferee != None && r.Prs[m.From].Match >= r.RaftLog.committed {
+		// transferee的日志已经更新完毕，继续leader transfer的过程
+		r.Step(pb.Message{From: r.leadTransferee, MsgType: pb.MessageType_MsgTransferLeader})
+	}
 }
 
 func (r *Raft) handlePropose(m pb.Message) {
-	if r.State != StateLeader {
+	if r.State != StateLeader || r.leadTransferee != None {
+		// 本节点已经不是leader or 处于leader transfer过程中
 		return
 	}
 	r.RaftLog.AppendEntries(m.Entries, r.Term)
@@ -677,12 +694,43 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 	}
 }
 
+func (r *Raft) handleTransferLeader(m pb.Message) {
+	// local Message，不需要检验Term
+	// transferee存在m.From里面
+	if _, ok := r.Prs[m.From]; !ok {
+		// transferee不存在，就不用做任何事
+		return
+	}
+	if r.State == StateLeader && r.Prs[m.From].Match < r.RaftLog.committed {
+		// 不满足成为leader的条件（logEntry没有达到最新）
+		r.leadTransferee = m.From
+		r.sendAppend(m.From)
+		return
+	}
+	r.msgs = append(r.msgs, pb.Message{
+		MsgType: pb.MessageType_MsgTimeoutNow,
+		From:    r.id,
+		To:      m.From,
+		Term:    r.Term,
+	})
+}
+
+func (r *Raft) handleTimeoutNow(m pb.Message) {
+	if r.CheckTerm(m.Term, m.From) {
+		r.Step(pb.Message{MsgType: pb.MessageType_MsgHup})
+	}
+}
+
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
-	// Your Code Here (3A).
+	r.votes[id] = false
+	r.Prs[id] = &Progress{}
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
-	// Your Code Here (3A).
+	delete(r.Prs, id)
+	delete(r.votes, id)
+	r.updateCommitIndex()
+	// 节点减少后，可能部分logEntry满足了大多数原则，可以抬升commitIndex
 }
