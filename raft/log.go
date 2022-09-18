@@ -78,7 +78,7 @@ func newLog(storage Storage) *RaftLog {
 	raftlog.entries, _ = storage.Entries(firstIndex, raftlog.stabled+1)
 	hardState, _, _ := storage.InitialState()
 	raftlog.committed = hardState.Commit
-	raftlog.applied = raftlog.truncateIndex
+	raftlog.applied = storage.AppliedIndex()
 	return raftlog
 }
 
