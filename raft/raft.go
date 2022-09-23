@@ -19,6 +19,7 @@ import (
 	"math/rand"
 	"sort"
 
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
 	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -260,7 +261,7 @@ func (r *Raft) sendHeartbeat(to uint64) {
 		From:    r.id,
 		To:      to,
 		Term:    r.Term,
-		Commit:  r.RaftLog.committed,
+		Commit:  util.RaftInvalidIndex,
 	})
 }
 
@@ -350,10 +351,6 @@ func (r *Raft) becomeLeader() {
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
-	if _, exist := r.Prs[r.id]; !exist {
-		// 如果本节点已经被移出集群，那么不处理收到的Msg
-		return nil
-	}
 	switch m.MsgType {
 	case pb.MessageType_MsgHup:
 		r.handleMsgHup(m)
@@ -396,7 +393,8 @@ func (r *Raft) updateCommitIndex() {
 	for wantCommitted := matchArr[(len(matchArr)-1)/2]; wantCommitted > 0; wantCommitted-- {
 		// 只允许提交当前周期的entry
 		logTerm, _ := r.RaftLog.Term(wantCommitted)
-		if logTerm == r.Term {
+		// 由于deleteNode会删除节点后再调用updateCommitIndex,可能会诱发committed回退的case
+		if logTerm == r.Term && wantCommitted > olderCommitted {
 			r.RaftLog.committed = wantCommitted
 			break
 		}
@@ -723,12 +721,21 @@ func (r *Raft) handleTimeoutNow(m pb.Message) {
 
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
+	if _, ok := r.Prs[id]; ok {
+		// 重复的addNode请求，去重
+		return
+	}
 	r.votes[id] = false
-	r.Prs[id] = &Progress{}
+	// 初始化为1而不是0,主要是为了防止sendAppend中 prevLogIndex = Next - 1,导致prevLogIndex溢出
+	r.Prs[id] = &Progress{Next: 1}
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
+	if _, ok := r.Prs[id]; !ok {
+		// 重复的removeNode请求，去重
+		return
+	}
 	delete(r.Prs, id)
 	delete(r.votes, id)
 	r.updateCommitIndex()

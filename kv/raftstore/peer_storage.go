@@ -371,6 +371,8 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 		PrevRegion: ps.region,
 		Region:     snapData.Region,
 	}
+	// 对指向的region结构体赋值，而不是改变ps.region的指针值（保证storeMeta.region[Meta.Id]和ps.region指向同一个值）
+	*ps.region = *snapData.Region
 	meta.WriteRegionState(kvWB, snapData.Region, rspb.PeerState_Normal)
 	return res, nil
 }
@@ -395,7 +397,7 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	if !raft.IsEmptySnap(&ready.Snapshot) && ps.validateSnap(&ready.Snapshot) {
 		kvWB := new(engine_util.WriteBatch)
 		defer kvWB.MustWriteToDB(ps.Engines.Kv)
-		ps.ApplySnapshot(&ready.Snapshot, kvWB, raftWB)
+		return ps.ApplySnapshot(&ready.Snapshot, kvWB, raftWB)
 	}
 	return nil, nil
 }

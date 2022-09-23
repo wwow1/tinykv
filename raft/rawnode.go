@@ -150,10 +150,13 @@ func (rn *RawNode) Step(m pb.Message) error {
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
 	ready := Ready{
-		SoftState:        &SoftState{Lead: rn.Raft.Lead, RaftState: rn.Raft.State},
-		Entries:          rn.Raft.RaftLog.unstableEntries(),
-		CommittedEntries: rn.Raft.RaftLog.nextEnts(),
-		Messages:         rn.Raft.msgs,
+		SoftState: &SoftState{Lead: rn.Raft.Lead, RaftState: rn.Raft.State},
+		Entries:   rn.Raft.RaftLog.unstableEntries(),
+		Messages:  rn.Raft.msgs,
+	}
+	if rn.Raft.Lead != None {
+		// project3b: 故障恢复时，在没有leader的情况下apply ConfChange,略过了向scheduler发送心跳的行为
+		ready.CommittedEntries = rn.Raft.RaftLog.nextEnts()
 	}
 	nowHardState := pb.HardState{
 		Term:   rn.Raft.Term,
