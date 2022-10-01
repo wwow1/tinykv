@@ -538,6 +538,7 @@ func (r *Raft) handlePropose(m pb.Message) {
 		// 本节点已经不是leader or 处于leader transfer过程中
 		return
 	}
+	// log.Infof("term %v, peer %v, proposal a new entry[%v]", r.Term, r.id, m.Entries)
 	r.RaftLog.AppendEntries(m.Entries, r.Term)
 	r.Prs[r.id].Match = r.RaftLog.LastIndex()
 	r.Prs[r.id].Next = r.Prs[r.id].Match + 1
@@ -583,6 +584,7 @@ func (r *Raft) handleMsgHup(m pb.Message) {
 	}
 	r.becomeCandidate()
 	r.electionRejectNum = 0
+	// log.Infof("Term %v peer %v try to start a leader election", r.Term, r.id)
 	for peer, _ := range r.Prs {
 		if peer == r.id {
 			// only 1 raft node in whole cluster
@@ -625,7 +627,7 @@ func (r *Raft) handleRequestVoteResponse(m pb.Message) {
 		return
 	}
 	r.votes[m.From] = true
-	// log.Debug("Term %v, peer %v receive RequestResponse from peer %v response{%v}, votes{%v}", r.Term, r.id, m.From, m, r.votes)
+	// log.Infof("Term %v, peer %v receive RequestResponse from peer %v response{%v}, votes{%v}", r.Term, r.id, m.From, m, r.votes)
 	var voteNum int
 	for _, voteGranted := range r.votes {
 		if voteGranted {

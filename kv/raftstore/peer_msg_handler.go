@@ -14,6 +14,7 @@ import (
 	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/log"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+	"github.com/pingcap-incubator/tinykv/proto/pkg/errorpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_cmdpb"
 	rspb "github.com/pingcap-incubator/tinykv/proto/pkg/raft_serverpb"
@@ -58,22 +59,49 @@ func (d *peerMsgHandler) findProposal(ent *eraftpb.Entry) (cb *message.Callback)
 	return nil
 }
 
+func (d *peerMsgHandler) CheckKeyInRegion(resp *raft_cmdpb.RaftCmdResponse, key *[]byte) bool {
+	err := util.CheckKeyInRegion(*key, d.Region())
+	if err == nil {
+		return true
+	}
+	log.Infof("key not in region")
+	if resp.Header.Error == nil {
+		resp.Header.Error = &errorpb.Error{}
+	}
+	resp.Header.Error.KeyNotInRegion = &errorpb.KeyNotInRegion{
+		Key:      *key,
+		RegionId: d.regionId,
+		StartKey: d.Region().StartKey,
+		EndKey:   d.Region().EndKey,
+	}
+	return false
+}
+
 func (d *peerMsgHandler) applyRWRequest(kvWB *engine_util.WriteBatch, resp *raft_cmdpb.RaftCmdResponse, reqs []*raft_cmdpb.Request, cb *message.Callback) {
 	for _, req := range reqs {
 		switch req.CmdType {
 		case raft_cmdpb.CmdType_Delete:
+			if !d.CheckKeyInRegion(resp, &req.Delete.Key) {
+				return
+			}
 			kvWB.DeleteCF(req.Delete.Cf, req.Delete.Key)
 			resp.Responses = []*raft_cmdpb.Response{
 				{CmdType: raft_cmdpb.CmdType_Delete,
 					Delete: &raft_cmdpb.DeleteResponse{}},
 			}
 		case raft_cmdpb.CmdType_Put:
+			if !d.CheckKeyInRegion(resp, &req.Put.Key) {
+				return
+			}
 			kvWB.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
 			resp.Responses = []*raft_cmdpb.Response{
 				{CmdType: raft_cmdpb.CmdType_Put,
 					Put: &raft_cmdpb.PutResponse{}},
 			}
 		case raft_cmdpb.CmdType_Get:
+			if !d.CheckKeyInRegion(resp, &req.Get.Key) {
+				return
+			}
 			val, err := engine_util.GetCF(d.peerStorage.Engines.Kv, req.Get.Cf, req.Get.Key)
 			if err != nil {
 				panic("peerMsgHandler::processEntry GetCF")
@@ -127,25 +155,38 @@ func (d *peerMsgHandler) applyAdminRequest(kvWB *engine_util.WriteBatch, resp *r
 			defer storeMeta.Unlock()
 			storeMeta.regionRanges.Delete(&regionItem{region: oldRegion})
 			oldRegion.RegionEpoch.Version++
+
 			// 创建新的Region
-			newRegion := *oldRegion
+			newRegion := new(metapb.Region)
+			err = util.CloneMsg(d.Region(), newRegion)
+			if err != nil {
+				return
+			}
 			oldRegion.EndKey = req.Split.SplitKey
 			newRegion.Id = req.Split.NewRegionId
 			newRegion.StartKey = req.Split.SplitKey
 			// newRegion的peers需要怎么设置(TODO)
+			newRegion.Peers = make([]*metapb.Peer, 0)
+			oldPeers := oldRegion.GetPeers()
+			for idx, newPeerId := range req.Split.NewPeerIds {
+				newRegion.Peers = append(newRegion.Peers, &metapb.Peer{Id: newPeerId, StoreId: oldPeers[idx].StoreId})
+			}
 			// 将新旧两个region结构持久化
 			meta.WriteRegionState(&kvWB, oldRegion, rspb.PeerState_Normal)
-			meta.WriteRegionState(&kvWB, &newRegion, rspb.PeerState_Normal)
-			newPeer, err := createPeer(d.storeID(), d.ctx.cfg, d.ctx.regionTaskSender, d.ctx.engine, &newRegion)
+			meta.WriteRegionState(&kvWB, newRegion, rspb.PeerState_Normal)
+			newPeer, err := createPeer(d.storeID(), d.ctx.cfg, d.ctx.regionTaskSender, d.ctx.engine, newRegion)
 			if err != nil {
 				panic(err)
 			}
 			// 向router注册新的peer结构(这样发送过来的RaftMessage才能被peer接收到)
 			d.ctx.router.register(newPeer)
+			// 启动新分裂出来的peer
+			_ = d.ctx.router.send(newRegion.Id, message.Msg{Type: message.MsgTypeStart})
 			// 将region信息更新到storeMeta中
-			storeMeta.setRegion(&newRegion, newPeer)
+			storeMeta.setRegion(newRegion, newPeer)
 			storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: oldRegion})
-			storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: &newRegion})
+			storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: newRegion})
+			log.Infof("peer %v split region, oldRegion[%v], newRegion[%v]", d.Meta.Id, oldRegion, newRegion)
 			if d.IsLeader() {
 				d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
 			}
