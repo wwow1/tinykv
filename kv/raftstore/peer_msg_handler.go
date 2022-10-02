@@ -77,31 +77,40 @@ func (d *peerMsgHandler) CheckKeyInRegion(resp *raft_cmdpb.RaftCmdResponse, key 
 	return false
 }
 
-func (d *peerMsgHandler) applyRWRequest(kvWB *engine_util.WriteBatch, resp *raft_cmdpb.RaftCmdResponse, reqs []*raft_cmdpb.Request, cb *message.Callback) {
-	for _, req := range reqs {
+func (d *peerMsgHandler) extractKey(req *raft_cmdpb.Request) []byte {
+	var key []byte
+	switch req.CmdType {
+	case raft_cmdpb.CmdType_Delete:
+		key = req.Delete.Key
+	case raft_cmdpb.CmdType_Put:
+		key = req.Put.Key
+	case raft_cmdpb.CmdType_Get:
+		key = req.Get.Key
+	default:
+	}
+	return key
+}
+
+func (d *peerMsgHandler) applyRWRequest(kvWB *engine_util.WriteBatch, resp *raft_cmdpb.RaftCmdResponse, reqs *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+	for _, req := range reqs.Requests {
+		key := d.extractKey(req)
+		if key != nil && !d.CheckKeyInRegion(resp, &key) {
+			return
+		}
 		switch req.CmdType {
 		case raft_cmdpb.CmdType_Delete:
-			if !d.CheckKeyInRegion(resp, &req.Delete.Key) {
-				return
-			}
 			kvWB.DeleteCF(req.Delete.Cf, req.Delete.Key)
 			resp.Responses = []*raft_cmdpb.Response{
 				{CmdType: raft_cmdpb.CmdType_Delete,
 					Delete: &raft_cmdpb.DeleteResponse{}},
 			}
 		case raft_cmdpb.CmdType_Put:
-			if !d.CheckKeyInRegion(resp, &req.Put.Key) {
-				return
-			}
 			kvWB.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
 			resp.Responses = []*raft_cmdpb.Response{
 				{CmdType: raft_cmdpb.CmdType_Put,
 					Put: &raft_cmdpb.PutResponse{}},
 			}
 		case raft_cmdpb.CmdType_Get:
-			if !d.CheckKeyInRegion(resp, &req.Get.Key) {
-				return
-			}
 			val, err := engine_util.GetCF(d.peerStorage.Engines.Kv, req.Get.Cf, req.Get.Key)
 			if err != nil {
 				panic("peerMsgHandler::processEntry GetCF")
@@ -111,6 +120,14 @@ func (d *peerMsgHandler) applyRWRequest(kvWB *engine_util.WriteBatch, resp *raft
 					Get: &raft_cmdpb.GetResponse{Value: val}},
 			}
 		case raft_cmdpb.CmdType_Snap:
+			if reqs.Header.RegionEpoch.ConfVer != d.Region().RegionEpoch.ConfVer ||
+				reqs.Header.RegionEpoch.Version != d.Region().RegionEpoch.Version {
+				if resp.Header.Error == nil {
+					resp.Header.Error = &errorpb.Error{}
+				}
+				resp.Header.Error.EpochNotMatch = &errorpb.EpochNotMatch{CurrentRegions: []*metapb.Region{d.Region()}}
+				return
+			}
 			resp.Responses = []*raft_cmdpb.Response{
 				{CmdType: raft_cmdpb.CmdType_Snap,
 					Snap: &raft_cmdpb.SnapResponse{Region: d.Region()}},
@@ -146,7 +163,8 @@ func (d *peerMsgHandler) applyAdminRequest(kvWB *engine_util.WriteBatch, resp *r
 			// 前置检查
 			err := util.CheckKeyInRegion(req.Split.SplitKey, oldRegion)
 			if err != nil {
-				panic(err)
+				log.Infof("peer %v ignore a duplicate split command {%v}", d.Meta.Id, req)
+				return
 			}
 			var kvWB engine_util.WriteBatch
 			defer kvWB.MustWriteToDB(d.ctx.engine.Kv)
@@ -186,7 +204,7 @@ func (d *peerMsgHandler) applyAdminRequest(kvWB *engine_util.WriteBatch, resp *r
 			storeMeta.setRegion(newRegion, newPeer)
 			storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: oldRegion})
 			storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: newRegion})
-			log.Infof("peer %v split region, oldRegion[%v], newRegion[%v]", d.Meta.Id, oldRegion, newRegion)
+			// log.Infof("peer %v split region, oldRegion[%v], newRegion[%v]", d.Meta.Id, oldRegion, newRegion)
 			if d.IsLeader() {
 				d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
 			}
@@ -295,7 +313,7 @@ func (d *peerMsgHandler) processEntry(ent eraftpb.Entry) {
 	defer kvWB.MustWriteToDB(d.ctx.engine.Kv)
 	resp := raft_cmdpb.RaftCmdResponse{Header: newCmdResp().Header}
 	if ent.EntryType == eraftpb.EntryType_EntryNormal {
-		d.applyRWRequest(&kvWB, &resp, req.Requests, cb)
+		d.applyRWRequest(&kvWB, &resp, &req, cb)
 		d.applyAdminRequest(&kvWB, &resp, req.AdminRequest)
 	} else {
 		// EntryType_EntryConfChange
