@@ -200,7 +200,7 @@ func (p *peer) MaybeDestroy() bool {
 func (p *peer) Destroy(engine *engine_util.Engines, keepData bool) error {
 	start := time.Now()
 	region := p.Region()
-	log.Infof("%v begin to destroy", p.Tag)
+	log.Infof("%v, storeId[%v] begin to destroy", p.Tag, p.Meta.StoreId)
 
 	// Set Tombstone state explicitly
 	kvWB := new(engine_util.WriteBatch)
@@ -223,12 +223,21 @@ func (p *peer) Destroy(engine *engine_util.Engines, keepData bool) error {
 		p.peerStorage.ClearData()
 	}
 
-	for _, proposal := range p.proposals {
-		NotifyReqRegionRemoved(region.Id, proposal.cb)
+	// 只有本节点是当前leader,且proposal是本周期传入的情况才需要回复pending requests
+	// 对本节点是旧leader的场景来说，它也会有proposals，但是client端的cb已经超时并清空，
+	// 执行下列语句会导致当前goroutine阻塞在NotifyReqRegionRemoved中
+	if p.IsLeader() {
+		for _, proposal := range p.proposals {
+			if proposal.term != p.Term() {
+				continue
+			}
+			log.Infof("peer %v is destorying, and now notify proposal %v, the region is remove", p.Meta.Id, proposal)
+			NotifyReqRegionRemoved(region.Id, proposal.cb)
+		}
 	}
 	p.proposals = nil
 
-	log.Infof("%v destroy itself, takes %v", p.Tag, time.Now().Sub(start))
+	log.Infof("%v storeId[%v] destroy itself, takes %v", p.Tag, p.Meta.StoreId, time.Now().Sub(start))
 	return nil
 }
 

@@ -184,19 +184,30 @@ func newRaft(c *Config) *Raft {
 	if len(c.peers) == 0 {
 		c.peers = confState.Nodes
 	}
+	// maxPeer := c.ID
 	for _, peer := range c.peers {
 		raft.votes[peer] = false
 		raft.Prs[peer] = &Progress{}
+		// maxPeer = max(maxPeer, peer)
 	}
 	raft.Term = hardState.Term
 	raft.Vote = hardState.Vote
 
-	storageLastIndex, err := raft.RaftLog.storage.LastIndex()
+	_, err := raft.RaftLog.storage.LastIndex()
 	if err != nil {
 		panic("xxx")
 	}
-	log.Infof("peer %v start, Term %v, committed = %v, lastIndex = %v, stabled = %v, applied = %v, storageLastIndex = %v", raft.id, raft.Term,
-		raft.RaftLog.committed, raft.RaftLog.LastIndex(), raft.RaftLog.stabled, raft.RaftLog.applied, storageLastIndex)
+	log.Infof("peer %v start, Term %v, committed = %v, lastIndex = %v, stabled = %v, applied = %v", raft.id, raft.Term,
+		raft.RaftLog.committed, raft.RaftLog.LastIndex(), raft.RaftLog.stabled, raft.RaftLog.applied)
+	/* 和Lab2的单测冲突
+	if maxPeer == raft.id {
+		raft.Step(pb.Message{
+			MsgType: pb.MessageType_MsgTimeoutNow,
+			From:    raft.id,
+			To:      raft.id,
+			Term:    raft.Term})
+	}
+	*/
 	return raft
 }
 
@@ -228,7 +239,9 @@ func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
 	prevLogIndex := r.Prs[to].Next - 1
 	if prevLogIndex > r.RaftLog.LastIndex() {
-		panic("Raft::sendAppend prevLogIndex > lastIndex")
+		log.Infof("Raft::sendAppend prevLogIndex > lastIndex")
+		r.Prs[to].Next = r.RaftLog.LastIndex() + 1
+		return r.sendAppend(to)
 	}
 	if prevLogIndex < r.RaftLog.truncateIndex {
 		// 发送快照
@@ -309,6 +322,12 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.Lead = lead
 	r.Vote = lead
 	r.leadTransferee = None
+	// 重置Next和Match
+	for _, progress := range r.Prs {
+		progress.Next = 0
+		progress.Match = 0
+	}
+	log.Infof("term %v, peer %v become follower", r.Term, r.id)
 }
 
 // becomeCandidate transform this peer's state to candidate
@@ -339,7 +358,7 @@ func (r *Raft) becomeLeader() {
 		progress.Next = r.RaftLog.LastIndex() + 1
 		progress.Match = 0
 	}
-	log.Infof("node %d become leader, term %d", r.id, r.Term)
+	log.Infof("term %d, node %d become leader", r.Term, r.id)
 	// propose a noop entry
 	r.Step(pb.Message{
 		MsgType: pb.MessageType_MsgPropose,
@@ -529,6 +548,8 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 	r.updateCommitIndex()
 	if r.leadTransferee != None && r.Prs[m.From].Match >= r.RaftLog.committed {
 		// transferee的日志已经更新完毕，继续leader transfer的过程
+		log.Infof("peer %v, transferee's Match = %v, r.committed = %v, r.lastLogIndex = %v, execute TransferLeader again",
+			r.id, r.RaftLog.committed, r.RaftLog.LastIndex())
 		r.Step(pb.Message{From: r.leadTransferee, MsgType: pb.MessageType_MsgTransferLeader})
 	}
 }
@@ -584,7 +605,7 @@ func (r *Raft) handleMsgHup(m pb.Message) {
 	}
 	r.becomeCandidate()
 	r.electionRejectNum = 0
-	// log.Infof("Term %v peer %v try to start a leader election", r.Term, r.id)
+	log.Infof("Term %v peer %v try to start a leader election", r.Term, r.id)
 	for peer, _ := range r.Prs {
 		if peer == r.id {
 			// only 1 raft node in whole cluster
@@ -666,8 +687,8 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 			}
 		}
 	}
-	// log.Debug("Term %v, node %v REJECT{%v} to vote for candidate %v {m.Index = %v, m.LogTerm = %v, m.Term = %v},{myLastLogIndex = %v, myLastLogTerm = %v}, m{%v}",
-	// 	r.Term, r.id, reject, m.From, m.Index, m.LogTerm, m.Term, MyLastLogIndex, MyLastLogTerm, m)
+	log.Infof("Term %v, node %v REJECT{%v} to vote for candidate %v {m.Index = %v, m.LogTerm = %v, m.Term = %v},{myLastLogIndex = %v, myLastLogTerm = %v}, m{%v}",
+		r.Term, r.id, reject, m.From, m.Index, m.LogTerm, m.Term, MyLastLogIndex, MyLastLogTerm, m)
 	r.msgs = append(r.msgs, pb.Message{
 		MsgType: pb.MessageType_MsgRequestVoteResponse,
 		Reject:  reject,
@@ -705,6 +726,8 @@ func (r *Raft) handleTransferLeader(m pb.Message) {
 		// 不满足成为leader的条件（logEntry没有达到最新）
 		r.leadTransferee = m.From
 		r.sendAppend(m.From)
+		log.Infof("peer %v transferLeader fail, transferee's log is stale, Match = %v, leader's LastIndex = %v",
+			r.id, r.Prs[m.From].Match, r.RaftLog.committed)
 		return
 	}
 	r.msgs = append(r.msgs, pb.Message{
@@ -713,18 +736,29 @@ func (r *Raft) handleTransferLeader(m pb.Message) {
 		To:      m.From,
 		Term:    r.Term,
 	})
+	// log.Infof("peer %v send TimeoutNow Message to peer %v", r.id, m.From)
 }
 
 func (r *Raft) handleTimeoutNow(m pb.Message) {
-	if r.CheckTerm(m.Term, m.From) {
-		r.Step(pb.Message{MsgType: pb.MessageType_MsgHup})
+	if r.id != m.To {
+		panic("timeoutNow")
 	}
+	if _, ok := r.Prs[m.To]; !ok {
+		// 当前节点已退出
+		log.Infof("peer %v is exit, r.prs[%v]", m.To, r.Prs)
+		return
+	}
+	if !r.CheckTerm(m.Term, None) {
+		return
+	}
+	r.Step(pb.Message{MsgType: pb.MessageType_MsgHup})
 }
 
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	if _, ok := r.Prs[id]; ok {
 		// 重复的addNode请求，去重
+		log.Infof("peer %v receive duplicate addNode request,ignore it", r.id)
 		return
 	}
 	r.votes[id] = false
@@ -740,6 +774,24 @@ func (r *Raft) removeNode(id uint64) {
 	}
 	delete(r.Prs, id)
 	delete(r.votes, id)
-	r.updateCommitIndex()
+	if r.State == StateLeader {
+		r.updateCommitIndex()
+	}
 	// 节点减少后，可能部分logEntry满足了大多数原则，可以抬升commitIndex
+}
+
+// 找到除了当前leader以外最新的那个节点，用于调用transferLeader
+func (r *Raft) GetUpdateToDatePeer() uint64 {
+	maxLogIndex := None
+	newestPeer := None
+	for Id, progress := range r.Prs {
+		if r.id == Id {
+			continue
+		}
+		if maxLogIndex < progress.Match {
+			newestPeer = Id
+			maxLogIndex = progress.Match
+		}
+	}
+	return newestPeer
 }

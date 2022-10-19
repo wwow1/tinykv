@@ -479,6 +479,7 @@ func (m *MockSchedulerClient) findRegion(key []byte) *regionItem {
 func (m *MockSchedulerClient) addRegionLocked(region *metapb.Region) {
 	m.regionsKey[region.GetId()] = region.GetStartKey()
 	m.regionsRange.ReplaceOrInsert(&regionItem{region: *region})
+	log.Infof("scheduler add region{%v}", region)
 }
 
 func (m *MockSchedulerClient) removeRegionLocked(region *metapb.Region) {

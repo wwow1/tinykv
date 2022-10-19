@@ -48,6 +48,7 @@ func (d *peerMsgHandler) findProposal(ent *eraftpb.Entry) (cb *message.Callback)
 		if proposal.index == ent.Index {
 			if proposal.term != ent.Term {
 				// 该proposal对应的命令没有被raft提交（超时或是其他原因）
+				log.Infof("peer %v delete stale proposal %v", d.Meta.Id, proposal)
 				NotifyStaleReq(ent.Term, proposal.cb)
 			} else {
 				cb = proposal.cb
@@ -235,6 +236,14 @@ func (d *peerMsgHandler) addNode(changePeer *metapb.Peer, confChange *eraftpb.Co
 	// 向PeersStartPendingTime中添加新节点的信息
 	d.PeersStartPendingTime[changePeer.Id] = time.Now()
 	d.RaftGroup.ApplyConfChange(*confChange)
+	log.Infof("peer[%v] add other-peer[%v] to region[%v], now region-peers[%v], regionConfVer[%d]",
+		d.Meta.Id, confChange.NodeId, d.regionId, d.Region().Peers, d.peerStorage.region.RegionEpoch.ConfVer)
+
+	if !d.stopped && d.IsLeader() {
+		// 每次触发ConfChange后，立刻向scheduler发送心跳更新region
+		d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
+		log.Infof("peer[%v] send heartBeat to scheduler, region[%v]", d.Meta.Id, d.peerStorage.region)
+	}
 }
 
 func (d *peerMsgHandler) removeNode(changePeer *metapb.Peer, confChange *eraftpb.ConfChange) {
@@ -242,14 +251,31 @@ func (d *peerMsgHandler) removeNode(changePeer *metapb.Peer, confChange *eraftpb
 		if peer.Id != changePeer.Id {
 			continue
 		}
-		d.removePeerCache(d.Meta.Id)
-		if changePeer.Id == d.Meta.Id {
-			if len(d.peerStorage.region.Peers) == 2 && d.IsLeader() {
-				// 针对场景：只剩2节点，且本节点是即将被remove的leader
-				// 需要暂时拒绝本次removeNode请求,并且向另一个节点发送transferLeader请求转移leader
-				d.processTransferLeader(d.peerStorage.region.Peers[(i+1)%2].Id, nil)
+		/*
+			if d.peer.RaftGroup.Raft.Lead == changePeer.Id {
+				if d.Meta.Id != d.peer.RaftGroup.Raft.Lead {
+					return
+				}
+				peerId := d.RaftGroup.Raft.GetUpdateToDatePeer()
+				d.processTransferLeader(peerId, nil)
+				log.Infof("peer %v want to delete peer %v, but it is leader,we should first transfer leader to peer %v",
+					d.Meta.Id, changePeer.Id, peerId)
 				return
 			}
+		*/
+		if len(d.peerStorage.region.Peers) == 2 && d.peer.RaftGroup.Raft.Lead == changePeer.Id {
+			// 针对场景：只剩2节点，且要删除的节点是leader
+			// 需要暂时拒绝本次removeNode请求,并且向另一个follower节点发送transferLeader请求转移leader
+			if d.Meta.Id != d.peer.RaftGroup.Raft.Lead {
+				return
+			}
+			d.processTransferLeader(d.peerStorage.region.Peers[(i+1)%2].Id, nil)
+			log.Infof("peer %v want to delete peer %v, but it is leader,we should first transfer leader to peer %v",
+				d.Meta.Id, changePeer.Id, d.peerStorage.region.Peers[(i+1)%2].Id)
+			return
+		}
+		d.removePeerCache(d.Meta.Id)
+		if changePeer.Id == d.Meta.Id {
 			// 如果被删除的节点是自己，那么删除本节点的peer结构
 			d.destroyPeer()
 			d.peerStorage.region.Peers = append(d.peerStorage.region.Peers[:i], d.peerStorage.region.Peers[i+1:]...)
@@ -259,6 +285,14 @@ func (d *peerMsgHandler) removeNode(changePeer *metapb.Peer, confChange *eraftpb
 		d.peerStorage.region.Peers = append(d.peerStorage.region.Peers[:i], d.peerStorage.region.Peers[i+1:]...)
 		d.peerStorage.region.RegionEpoch.ConfVer++
 		d.RaftGroup.ApplyConfChange(*confChange)
+		log.Infof("peer[%v] remove other-peer[%v] to region[%v], now region-peers[%v], regionConfVer[%d]",
+			d.Meta.Id, confChange.NodeId, d.regionId, d.Region().Peers, d.peerStorage.region.RegionEpoch.ConfVer)
+
+		if !d.stopped && d.IsLeader() {
+			// 每次触发ConfChange后，立刻向scheduler发送心跳更新region
+			d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
+			log.Infof("peer[%v] send heartBeat to scheduler, region[%v]", d.Meta.Id, d.peerStorage.region)
+		}
 		return
 	}
 }
@@ -281,22 +315,10 @@ func (d *peerMsgHandler) processConfigChange(ent eraftpb.Entry) {
 	var kvWB engine_util.WriteBatch
 	defer kvWB.MustWriteToDB(d.ctx.engine.Kv)
 
-	defer func() {
-		if !d.stopped && d.IsLeader() {
-			// 每次触发ConfChange后，立刻向scheduler发送心跳更新region
-			d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
-			log.Infof("peer[%v] send heartBeat to scheduler, region[%v]", d.Meta.Id, d.peerStorage.region)
-		}
-	}()
-
 	if confChange.ChangeType == eraftpb.ConfChangeType_AddNode {
 		d.addNode(&changePeer, &confChange)
-		log.Infof("peer[%v] add other-peer[%v] to region[%v], now region-peers[%v], regionConfVer[%d], entIdx[%v]",
-			d.Meta.Id, confChange.NodeId, d.regionId, d.Region().Peers, d.peerStorage.region.RegionEpoch.ConfVer, ent.Index)
 	} else {
 		d.removeNode(&changePeer, &confChange)
-		log.Infof("peer[%v] remove other-peer[%v] to region[%v], now region-peers[%v], regionConfVer[%d], entIdx[%v]",
-			d.Meta.Id, confChange.NodeId, d.regionId, d.Region().Peers, d.peerStorage.region.RegionEpoch.ConfVer, ent.Index)
 	}
 
 	if !d.stopped {
@@ -342,9 +364,10 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		if snapshotApplyResult != nil {
 			storeMeta := d.ctx.storeMeta
 			storeMeta.Lock()
-			defer storeMeta.Unlock()
 			storeMeta.regionRanges.Delete(&regionItem{region: snapshotApplyResult.PrevRegion})
 			storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: snapshotApplyResult.Region})
+			// 不能defer Unlock,因为在processEntry中的Split和ConfigChange都可能调用Lock()导致死锁
+			storeMeta.Unlock()
 		}
 		d.Send(d.ctx.trans, rd.Messages)
 		for _, ent := range rd.CommittedEntries {
@@ -443,6 +466,7 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 	if msg.AdminRequest != nil && msg.AdminRequest.CmdType == raft_cmdpb.AdminCmdType_ChangePeer {
 		rawPeer, err := proto.Marshal(msg.AdminRequest.ChangePeer.Peer)
 		if err != nil {
+			panic("ChangePeer.Peer Marshal fail")
 			cb.Done(ErrResp(err))
 			return
 		}
@@ -625,8 +649,8 @@ func handleStaleMsg(trans Transport, msg *rspb.RaftMessage, curEpoch *metapb.Reg
 	msgType := msg.Message.GetMsgType()
 
 	if !needGC {
-		log.Infof("[region %d] raft message %s is stale, current %v ignore it",
-			regionID, msgType, curEpoch)
+		log.Infof("[region %d] raft message %s is stale epoch[%v], current %v ignore it",
+			regionID, msgType, msg.GetRegionEpoch(), curEpoch)
 		return
 	}
 	gcMsg := &rspb.RaftMessage{

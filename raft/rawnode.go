@@ -150,14 +150,19 @@ func (rn *RawNode) Step(m pb.Message) error {
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
 	ready := Ready{
-		SoftState: &SoftState{Lead: rn.Raft.Lead, RaftState: rn.Raft.State},
-		Entries:   rn.Raft.RaftLog.unstableEntries(),
-		Messages:  rn.Raft.msgs,
+		SoftState:        &SoftState{Lead: rn.Raft.Lead, RaftState: rn.Raft.State},
+		Entries:          rn.Raft.RaftLog.unstableEntries(),
+		Messages:         rn.Raft.msgs,
+		CommittedEntries: rn.Raft.RaftLog.nextEnts(),
 	}
-	if rn.Raft.Lead != None {
-		// project3b: 故障恢复时，在没有leader的情况下apply ConfChange,略过了向scheduler发送心跳的行为
-		ready.CommittedEntries = rn.Raft.RaftLog.nextEnts()
-	}
+	// 这块代码跟Lab2的部分单测冲突了,暂时注释掉
+	/*
+		if rn.Raft.Lead != None {
+			// project3b: 故障恢复时，在没有leader的情况下执行apply ConfChange（上一轮在apply之前crush了）,略过了向scheduler发送心跳的行为
+			// 假设出现多个confChange在recovery之后执行，那么在scheduler那里看到的ConfVersion就会不连续，导致报错
+			ready.CommittedEntries = rn.Raft.RaftLog.nextEnts()
+		}
+	*/
 	nowHardState := pb.HardState{
 		Term:   rn.Raft.Term,
 		Vote:   rn.Raft.Vote,
@@ -169,6 +174,8 @@ func (rn *RawNode) Ready() Ready {
 	if rn.Raft.RaftLog.pendingSnapshot != nil {
 		ready.Snapshot = *rn.Raft.RaftLog.pendingSnapshot
 	}
+	// 清空Msgs
+	rn.Raft.msgs = make([]pb.Message, 0)
 	return ready
 }
 
@@ -210,6 +217,7 @@ func (rn *RawNode) Advance(rd Ready) {
 	if len(rd.Entries) != 0 {
 		rn.Raft.RaftLog.stabled = rd.Entries[len(rd.Entries)-1].Index
 	}
+	// Debug
 	if len(rd.CommittedEntries) != 0 {
 		rn.Raft.RaftLog.applied = max(rd.CommittedEntries[len(rd.CommittedEntries)-1].Index,
 			rn.Raft.RaftLog.applied)
@@ -222,7 +230,6 @@ func (rn *RawNode) Advance(rd Ready) {
 	}
 	// 在Compact 以及 applySnapshot之后，都需要将内存中的日志给截断
 	rn.Raft.RaftLog.maybeCompact()
-	rn.Raft.msgs = make([]pb.Message, 0)
 }
 
 // GetProgress return the Progress of this node and its peers, if this
